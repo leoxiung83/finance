@@ -1,5 +1,7 @@
 import streamlit as st
 import pandas as pd
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 import os
 import json
 import time
@@ -8,14 +10,6 @@ import streamlit.components.v1 as components
 from datetime import datetime
 import zipfile
 import io
-
-# 嘗試匯入 Google 連線套件，若失敗則標記為不可用
-try:
-    import gspread
-    from oauth2client.service_account import ServiceAccountCredentials
-    HAS_GOOGLE_DEPS = True
-except ImportError:
-    HAS_GOOGLE_DEPS = False
 
 # --- PDF 報表相關套件 ---
 from reportlab.lib.pagesizes import A4
@@ -27,15 +21,13 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.lib.units import cm
 
 # 設定頁面
-st.set_page_config(page_title="勁翔營造 工地計帳系統", layout="wide", page_icon="🏗️")
+st.set_page_config(page_title="勁翔營造 工地計帳系統 (線上版)", layout="wide", page_icon="🏗️")
 
-# --- 檔案與字型設定 ---
-DATA_FILE = 'finance_data.csv'
-SETTINGS_FILE = 'finance_settings.json'
+# --- 常數與設定 ---
 FONT_FILE = 'kaiu.ttf' 
 FONT_NAME = 'Kaiu'
 
-# --- 台灣例假日設定 ---
+# --- 台灣例假日 ---
 HOLIDAYS = {
     "2025-01-01": "元旦", "2025-01-27": "小年夜", "2025-01-28": "除夕", "2025-01-29": "春節", "2025-01-30": "初二", "2025-01-31": "初三",
     "2025-02-28": "和平紀念日", "2025-04-04": "兒童節/清明節", "2025-05-01": "勞動節", "2025-05-31": "端午節",
@@ -57,148 +49,140 @@ DEFAULT_CAT_CONFIG = [
 ]
 
 # ==========================================
-# 1. 核心邏輯：雙模式切換 (Local vs Cloud)
+# 1. Google Sheets 連線與資料存取 (Cloud I/O)
 # ==========================================
 
-def check_connection_mode():
-    """檢查是否具備連線 Google Sheets 的條件"""
-    if not HAS_GOOGLE_DEPS:
-        return "local", "缺少 gspread 套件"
-    
-    # 檢查 Secrets 是否存在 (支援 Streamlit Cloud 的 secrets 或本地 .streamlit/secrets.toml)
-    if "gcp_service_account" not in st.secrets:
-        return "local", "缺少 Google 金鑰設定"
-        
-    return "cloud", "連線正常"
-
-MODE, MSG = check_connection_mode()
-
-# --- Google Sheets 連線函式 (僅在 cloud 模式使用) ---
 def get_google_sheet_client():
+    # 連線到 Google Sheets
     scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+    # 從 Streamlit Secrets 讀取金鑰
     creds_dict = dict(st.secrets["gcp_service_account"])
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
     client = gspread.authorize(creds)
     return client
 
-# --- 資料讀取 (雙模式) ---
+@st.cache_data(ttl=5) # 短暫快取避免頻繁讀取
 def load_data():
-    cols = ['日期', '專案', '類別', '項目內容', '單位', '數量', '單價', '總價',
-            '購買地點', '經手人', '憑證類型', '發票號碼', '備註', '月份']
-            
-    if MODE == 'cloud':
-        try:
-            client = get_google_sheet_client()
-            sheet = client.open("FinanceData").sheet1 
-            data = sheet.get_all_records()
-            if not data: return pd.DataFrame(columns=cols)
-            df = pd.DataFrame(data)
-            # 確保欄位齊全
-            for c in cols:
-                if c not in df.columns: df[c] = ""
-        except Exception as e:
-            st.error(f"雲端讀取失敗，切換回本地模式: {e}")
-            return load_local_data(cols)
-    else:
-        return load_local_data(cols)
-
-    # 共用格式處理
-    text_cols = ['發票號碼', '備註', '購買地點', '經手人', '項目內容', '專案', '類別', '單位', '憑證類型']
-    for col in text_cols:
-        if col in df.columns: df[col] = df[col].fillna("").astype(str)
-    if '日期' in df.columns:
-        df['日期'] = pd.to_datetime(df['日期']).dt.date
-        df['月份'] = pd.to_datetime(df['日期']).dt.strftime("%Y-%m")
-        df['Year'] = pd.to_datetime(df['日期']).dt.year
-    return df
-
-def load_local_data(cols):
-    if not os.path.exists(DATA_FILE):
-        df = pd.DataFrame(columns=cols)
-        df.to_csv(DATA_FILE, index=False, encoding='utf-8-sig')
-        return df
     try:
-        df = pd.read_csv(DATA_FILE)
-        # 格式處理同上
+        client = get_google_sheet_client()
+        # 假設資料存在名為 'FinanceData' 的試算表的第一個分頁
+        sheet = client.open("FinanceData").sheet1
+        data = sheet.get_all_records()
+        
+        cols = ['日期', '專案', '類別', '項目內容', '單位', '數量', '單價', '總價',
+                '購買地點', '經手人', '憑證類型', '發票號碼', '備註']
+        
+        if not data:
+            return pd.DataFrame(columns=cols)
+
+        df = pd.DataFrame(data)
+        
+        # 補齊缺失欄位
+        for c in cols:
+            if c not in df.columns: df[c] = ""
+
+        # 強制轉字串避免錯誤
         text_cols = ['發票號碼', '備註', '購買地點', '經手人', '項目內容', '專案', '類別', '單位', '憑證類型']
         for col in text_cols:
             if col in df.columns: df[col] = df[col].fillna("").astype(str)
-        df['日期'] = pd.to_datetime(df['日期']).dt.date
-        df['月份'] = pd.to_datetime(df['日期']).dt.strftime("%Y-%m")
-        df['Year'] = pd.to_datetime(df['日期']).dt.year
+            
+        if '日期' in df.columns:
+            df['日期'] = pd.to_datetime(df['日期']).dt.date
+            df['月份'] = pd.to_datetime(df['日期']).dt.strftime("%Y-%m")
+            df['Year'] = pd.to_datetime(df['日期']).dt.year
+            
         return df
-    except:
-        return pd.DataFrame(columns=cols)
+    except Exception as e:
+        st.error(f"雲端資料讀取失敗 (請檢查 Secrets 或 Google Sheet 名稱): {e}")
+        return pd.DataFrame()
 
-# --- 資料儲存 (雙模式) ---
 def save_dataframe(df):
     try:
-        # 移除輔助欄位
+        client = get_google_sheet_client()
+        sheet = client.open("FinanceData").sheet1
+        
+        # 移除輔助欄位再上傳
         cols_to_drop = ['月份', 'Year', 'temp_month', '刪除', '星期/節日']
         df_save = df.drop(columns=[c for c in cols_to_drop if c in df.columns])
+        df_save['日期'] = df_save['日期'].astype(str) # 日期轉字串
         
-        if MODE == 'cloud':
-            client = get_google_sheet_client()
-            sheet = client.open("FinanceData").sheet1
-            df_save['日期'] = df_save['日期'].astype(str)
-            sheet.clear()
-            sheet.update([df_save.columns.values.tolist()] + df_save.values.tolist())
-            st.toast("☁️ 資料已同步至 Google Sheets")
-        else:
-            df_save.to_csv(DATA_FILE, index=False, encoding='utf-8-sig')
-            st.toast("💾 資料已儲存至本地 CSV")
-            
+        sheet.clear() # 清空舊資料
+        sheet.update([df_save.columns.values.tolist()] + df_save.values.tolist()) # 寫入新資料
+        
+        load_data.clear() # 清除快取
         return True
     except Exception as e:
-        st.error(f"儲存失敗: {e}")
+        st.error(f"雲端儲存失敗: {e}")
         return False
 
-# --- 設定檔 I/O (雙模式) ---
+def append_finance_record(date, project, category, item, unit, qty, price, location, handler, r_type, inv_no, note):
+    total = qty * price
+    inv_no_str = str(inv_no) if inv_no else ""
+    row_data = [str(date), project, category, item, unit, qty, price, total, location, handler, r_type, inv_no_str, note]
+    
+    try:
+        client = get_google_sheet_client()
+        sheet = client.open("FinanceData").sheet1
+        sheet.append_row(row_data)
+        load_data.clear() # 清除快取
+    except Exception as e:
+        st.error(f"新增失敗: {e}")
+
+# --- 設定檔存取 (儲存在 Google Sheets 的 'Settings' 分頁) ---
 def load_settings():
-    default = {
+    default_settings = {
         "projects": ["預設專案"],
         "items": {"預設專案": {c["key"]: [] for c in DEFAULT_CAT_CONFIG}},
         "locations": {"預設專案": {c["key"]: [] for c in DEFAULT_CAT_CONFIG}},
         "cat_config": DEFAULT_CAT_CONFIG
     }
     
-    if MODE == 'cloud':
+    try:
+        client = get_google_sheet_client()
+        # 嘗試讀取名為 'Settings' 的分頁
         try:
-            client = get_google_sheet_client()
-            try:
-                ws = client.open("FinanceData").worksheet("Settings")
-                json_str = ws.acell('A1').value
-                if json_str: return json.loads(json_str)
-            except:
-                pass # 若無 Settings 分頁則回傳預設
+            ws = client.open("FinanceData").worksheet("Settings")
+            json_str = ws.acell('A1').value
+            if json_str:
+                data = json.loads(json_str)
+                # 補齊結構防止舊設定檔缺欄位
+                if "cat_config" not in data: data["cat_config"] = DEFAULT_CAT_CONFIG
+                if "locations" not in data: data["locations"] = {}
+                for p in data["projects"]:
+                    if p not in data["items"]: data["items"][p] = {c["key"]: [] for c in data["cat_config"]}
+                    if p not in data["locations"]: data["locations"][p] = {c["key"]: [] for c in data["cat_config"]}
+                    for c in data["cat_config"]:
+                        if c["key"] not in data["items"][p]: data["items"][p][c["key"]] = []
+                        if c["key"] not in data["locations"][p]: data["locations"][p][c["key"]] = []
+                return data
         except:
-            pass
+            pass # 若無分頁或讀取失敗，回傳預設值
             
-    # 本地模式或雲端失敗時
-    if not os.path.exists(SETTINGS_FILE): return default
-    with open(SETTINGS_FILE, 'r', encoding='utf-8') as f: return json.load(f)
+        return default_settings
+    except Exception as e:
+        return default_settings
 
-def save_settings(data):
-    if MODE == 'cloud':
+def save_settings(settings_data):
+    try:
+        client = get_google_sheet_client()
         try:
-            client = get_google_sheet_client()
-            try:
-                ws = client.open("FinanceData").worksheet("Settings")
-                ws.update('A1', [[json.dumps(data, ensure_ascii=False)]])
-            except:
-                st.warning("雲端無 'Settings' 分頁，設定僅存於本地。")
+            ws = client.open("FinanceData").worksheet("Settings")
         except:
-            pass
-            
-    # 本地也存一份當備份
-    with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
+            # 若無 Settings 分頁，嘗試建立 (通常需手動建立較保險)
+            st.warning("找不到 'Settings' 分頁，請在 Google Sheet 中新增名為 'Settings' 的分頁。")
+            return
+
+        json_str = json.dumps(settings_data, ensure_ascii=False)
+        ws.update('A1', [[json_str]])
+    except Exception as e:
+        st.error(f"設定儲存失敗: {e}")
 
 # --- 備份功能 (ZIP) ---
 def create_zip_backup(df, settings, target_project=None):
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
         if target_project and target_project != "所有專案 (完整系統)":
+            # 備份單一專案
             if not df.empty:
                 proj_df = df[df['專案'] == target_project]
                 csv_buffer = io.StringIO()
@@ -213,6 +197,7 @@ def create_zip_backup(df, settings, target_project=None):
             }
             zip_file.writestr('finance_settings.json', json.dumps(proj_settings, ensure_ascii=False, indent=4))
         else:
+            # 備份全部
             if not df.empty:
                 csv_buffer = io.StringIO()
                 df.to_csv(csv_buffer, index=False, encoding='utf-8-sig')
@@ -221,7 +206,10 @@ def create_zip_backup(df, settings, target_project=None):
     buffer.seek(0)
     return buffer
 
-# --- 輔助與 PDF ---
+# ==========================================
+# 2. 輔助函式與報表
+# ==========================================
+
 def get_date_info(date_obj):
     if isinstance(date_obj, str):
         try: date_obj = datetime.strptime(date_obj, "%Y-%m-%d").date()
@@ -234,44 +222,14 @@ def get_date_info(date_obj):
     if is_weekend: return f"🔴 {w_str}", True 
     return f"{w_str}", False
 
-def append_finance_record(date, project, category, item, unit, qty, price, location, handler, r_type, inv_no, note):
-    total = qty * price
-    inv_no_str = str(inv_no) if inv_no else ""
-    
-    if MODE == 'cloud':
-        # 雲端直接 append row 比較快
-        try:
-            client = get_google_sheet_client()
-            sheet = client.open("FinanceData").sheet1
-            row_data = [str(date), project, category, item, unit, qty, price, total, location, handler, r_type, inv_no_str, note]
-            sheet.append_row(row_data)
-            st.toast("☁️ 雲端寫入成功")
-            return
-        except Exception as e:
-            st.error(f"雲端寫入失敗: {e}")
-            # 失敗不 fallback，避免資料不同步
-            return
-
-    # 本地模式
-    new_row = pd.DataFrame([{
-        '日期': date, '專案': project, '類別': category, '項目內容': item,
-        '單位': unit, '數量': qty, '單價': price, '總價': total,
-        '購買地點': location, '經手人': handler, '憑證類型': r_type,
-        '發票號碼': inv_no_str, '備註': note
-    }])
-    current_df = load_local_data(['日期', '專案', '類別', '項目內容', '單位', '數量', '單價', '總價', '購買地點', '經手人', '憑證類型', '發票號碼', '備註'])
-    updated_df = pd.concat([current_df, new_row], ignore_index=True)
-    updated_df.to_csv(DATA_FILE, index=False, encoding='utf-8-sig')
-    st.toast("💾 本地儲存成功")
-
 def generate_pdf_report(df, project_name, year, month):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=1.0*cm, leftMargin=1.0*cm, topMargin=1.5*cm, bottomMargin=1.5*cm)
     
     font_path = FONT_FILE 
     if not os.path.exists(font_path):
-        st.warning(f"⚠️ 找不到 {FONT_FILE}，將使用預設字型。")
         font_main = 'Helvetica'; font_bold = 'Helvetica-Bold'
+        st.warning(f"⚠️ 找不到 {FONT_FILE}，請確認已上傳。")
     else:
         try:
             pdfmetrics.registerFont(TTFont(FONT_NAME, font_path))
@@ -332,7 +290,6 @@ def generate_pdf_report(df, project_name, year, month):
     col_widths = [55, 25, 85, 25, 25, 40, 50, 45, 35, 30, 50, 65]
     headers = ['日期', '星期', '項目內容', '單位', '數量', '單價', '總價', '地點', '經手', '憑證', '發票', '備註']
     weekdays_list = ["(週一)", "(週二)", "(週三)", "(週四)", "(週五)", "(週六)", "(週日)"]
-
     for cat in cat_order:
         cat_df = df[df['類別'] == cat].sort_values('日期', ascending=False).copy()
         if cat_df.empty: continue
@@ -353,17 +310,13 @@ def generate_pdf_report(df, project_name, year, month):
     return buffer
 
 # ==========================================
-# UI 介面
+# 3. UI 介面
 # ==========================================
 
 settings = load_settings()
 df = load_data()
 
-st.title("🏗️ 勁翔營造 工地計帳系統")
-if MODE == "local":
-    st.warning("⚠️ 目前為【單機離線模式】（未偵測到 Google 金鑰或 gspread 套件）。資料僅存於本地 CSV。")
-else:
-    st.toast("☁️ 已連線至 Google Sheets")
+st.title("🏗️ 勁翔營造 工地計帳系統 (線上版)")
 
 if 'last_check_date' not in st.session_state:
     st.session_state.last_check_date = datetime.now().date()
@@ -380,9 +333,11 @@ with st.sidebar:
     st.session_state.global_project = global_project
 
     global_date = st.date_input("記帳日期", st.session_state.last_check_date)
+    
     if global_date != st.session_state.last_check_date:
         st.session_state.last_check_date = global_date
         components.html("""<script>var tabs=window.parent.document.querySelectorAll('[data-testid="stTab"]');if(tabs.length>0){tabs[0].click();}</script>""", height=0, width=0)
+
     day_str, is_red = get_date_info(global_date)
     if is_red: st.markdown(f"<h3 style='color: #FF4B4B;'>{global_date} {day_str}</h3>", unsafe_allow_html=True)
     else: st.markdown(f"### {global_date} {day_str}")
@@ -415,6 +370,7 @@ with tab_entry:
 
         note = st.session_state.get(k_note, "")
         if not final_item: st.toast(f"❌ 請輸入 {display_name} 的項目/來源！", icon="⚠️"); return
+
         append_finance_record(global_date, global_project, conf_key, final_item, unit, qty, price, location, handler, r_type, inv_no, note)
         st.toast(f"✅ {display_name} 儲存成功！")
         st.session_state[k_man] = ""; st.session_state[k_price] = 0; st.session_state[k_note] = ""; st.session_state[k_buyer] = ""
@@ -429,7 +385,6 @@ with tab_entry:
         if k_man not in st.session_state: st.session_state[k_man] = ""
         if k_price not in st.session_state: st.session_state[k_price] = 0
         if k_qty not in st.session_state: st.session_state[k_qty] = 1.0
-        
         with st.expander(f"{icon} {conf['display']}", expanded=False):
             col1, col2 = st.columns(2)
             items_list = settings["items"].get(global_project, {}).get(conf["key"], [])
@@ -566,38 +521,37 @@ with tab_dash:
 with tab_settings:
     st.header("⚙️ 設定與管理")
     st.markdown("### 一、專案管理")
-    with st.expander("1. 資料備份與還原", expanded=False):
-        backup_target = st.selectbox("選擇備份對象", ["所有專案 (完整系統)", global_project])
+    with st.expander("1. 資料備份與還原 (ZIP/CSV)", expanded=False):
+        backup_target = st.selectbox("選擇要備份的對象", ["所有專案 (完整系統)", global_project])
         st.download_button(f"📦 下載備份 ({backup_target})", create_zip_backup(df, settings, target_project=backup_target), file_name=f"backup_{backup_target}_{datetime.now().strftime('%Y%m%d')}.zip", mime="application/zip")
-        
         st.divider()
         uploaded_file = st.file_uploader("📤 系統還原 (請上傳 ZIP 或 CSV)", type=['csv', 'zip'])
         if uploaded_file:
             if st.button("開始還原"):
                 try:
                     if uploaded_file.name.endswith('.csv'):
-                        pd.read_csv(uploaded_file).to_csv(DATA_FILE, index=False, encoding='utf-8-sig')
-                        st.success("CSV 還原成功 (僅本地模式生效)！")
+                        pd.read_csv(uploaded_file).to_csv(DATA_FILE, index=False, encoding='utf-8-sig'); st.success("CSV 資料還原成功！")
                     elif uploaded_file.name.endswith('.zip'):
                         with zipfile.ZipFile(uploaded_file, 'r') as z:
-                            if 'finance_data.csv' in z.namelist():
-                                with open(DATA_FILE, 'wb') as f: f.write(z.read('finance_data.csv'))
-                            if 'finance_settings.json' in z.namelist():
-                                with open(SETTINGS_FILE, 'wb') as f: f.write(z.read('finance_settings.json'))
-                        st.success("ZIP 還原成功 (僅本地模式生效)！")
+                            if DATA_FILE in z.namelist():
+                                with open(DATA_FILE, 'wb') as f: f.write(z.read(DATA_FILE))
+                            if SETTINGS_FILE in z.namelist():
+                                with open(SETTINGS_FILE, 'wb') as f: f.write(z.read(SETTINGS_FILE))
+                        st.success("ZIP 還原成功！")
                     time.sleep(1); st.rerun()
                 except Exception as e: st.error(f"還原失敗: {e}")
 
     with st.expander("2. 專案管理 (新增/匯入/改名/刪除)", expanded=True):
         c1, c2 = st.columns(2)
         with c1:
+            st.subheader("新增與改名")
             new_proj = st.text_input("新增專案名稱")
             if st.button("➕ 新增專案"):
                 if new_proj and new_proj not in settings["projects"]:
                     settings["projects"].append(new_proj)
                     settings["items"][new_proj] = {c["key"]: [] for c in settings["cat_config"]}
                     settings["locations"][new_proj] = {c["key"]: [] for c in settings["cat_config"]}
-                    save_settings(settings); st.success(f"已新增：{new_proj}"); time.sleep(1); st.rerun()
+                    save_json(SETTINGS_FILE, settings); st.success(f"已新增：{new_proj}"); time.sleep(1); st.rerun()
             st.divider()
             rename_proj = st.text_input("修改目前專案名稱", value=global_project)
             if st.button("✏️ 確認改名"):
@@ -605,15 +559,14 @@ with tab_settings:
                     settings["projects"] = [rename_proj if p == global_project else p for p in settings["projects"]]
                     settings["items"][rename_proj] = settings["items"].pop(global_project)
                     settings["locations"][rename_proj] = settings["locations"].pop(global_project)
-                    save_settings(settings)
-                    if not df.empty:
-                        df.loc[df['專案'] == global_project, '專案'] = rename_proj
-                        save_dataframe(df)
+                    save_json(SETTINGS_FILE, settings)
+                    if not df.empty: df.loc[df['專案'] == global_project, '專案'] = rename_proj; save_dataframe(df)
                     st.success(f"專案已改名為：{rename_proj}"); time.sleep(1); st.rerun()
         with c2:
+            st.subheader("匯入與刪除")
             other_projects = [p for p in settings["projects"] if p != global_project]
             if other_projects:
-                source_proj = st.selectbox("📥 匯入其他專案設定", other_projects)
+                source_proj = st.selectbox("📥 從其他專案匯入設定", other_projects)
                 if st.button("匯入設定"):
                     s_items = settings["items"].get(source_proj, {}); t_items = settings["items"].get(global_project, {})
                     s_locs = settings["locations"].get(source_proj, {}); t_locs = settings["locations"].get(global_project, {})
@@ -623,14 +576,14 @@ with tab_settings:
                     for cat, locs in s_locs.items():
                         for loc in locs:
                             if loc not in t_locs[cat]: t_locs[cat].append(loc)
-                    save_settings(settings); st.success("匯入完成！"); time.sleep(1); st.rerun()
+                    save_json(SETTINGS_FILE, settings); st.success("匯入完成！"); time.sleep(1); st.rerun()
             st.divider()
             if st.button("🗑️ 刪除此專案"):
                 if len(settings["projects"]) <= 1: st.error("無法刪除最後一個專案！")
                 else:
                     settings["projects"].remove(global_project)
                     del settings["items"][global_project]; del settings["locations"][global_project]
-                    save_settings(settings)
+                    save_json(SETTINGS_FILE, settings)
                     if not df.empty: save_dataframe(df[df['專案'] != global_project])
                     st.success("專案已刪除"); time.sleep(1); st.rerun()
 
@@ -646,7 +599,7 @@ with tab_settings:
                     settings["cat_config"].append({"key": new_cat_name, "display": new_cat_name, "type": new_cat_type})
                     for proj in settings["items"]:
                         settings["items"][proj][new_cat_name] = []; settings["locations"][proj][new_cat_name] = []
-                    save_settings(settings); st.success("已新增"); time.sleep(0.5); st.rerun()
+                    save_json(SETTINGS_FILE, settings); st.success("已新增"); time.sleep(0.5); st.rerun()
         
         st.divider()
         for idx, cat in enumerate(settings["cat_config"]):
@@ -656,10 +609,10 @@ with tab_settings:
             with c_btn:
                 if st.button("更新", key=f"btn_upd_cat_{idx}"):
                     settings["cat_config"][idx]["display"] = new_display
-                    save_settings(settings); st.success("已更新"); time.sleep(0.5); st.rerun()
+                    save_json(SETTINGS_FILE, settings); st.success("已更新"); time.sleep(0.5); st.rerun()
             with c_del:
                 if st.button("刪", key=f"btn_del_cat_{idx}"):
-                    settings["cat_config"].pop(idx); save_settings(settings); st.rerun()
+                    settings["cat_config"].pop(idx); save_json(SETTINGS_FILE, settings); st.rerun()
 
     with st.expander("2. 細項選單管理 (新增/改名/刪除)", expanded=True):
         target_cat = st.selectbox("選擇要管理的大項", [c["display"] for c in settings["cat_config"]])
@@ -684,7 +637,7 @@ with tab_settings:
                 if new_item and new_item not in current_list:
                     if list_type == "item": settings["items"][global_project][cat_key].append(new_item)
                     else: settings["locations"][global_project][cat_key].append(new_item)
-                    save_settings(settings); st.success("已加入"); st.rerun()
+                    save_json(SETTINGS_FILE, settings); st.success("已加入"); st.rerun()
         
         if current_list:
             st.markdown(f"#### 管理現有項目")
@@ -705,9 +658,9 @@ with tab_settings:
                             if not df.empty:
                                 mask = (df['專案'] == global_project) & (df['類別'] == cat_key) & (df['購買地點'] == item)
                                 df.loc[mask, '購買地點'] = ren_item; save_dataframe(df)
-                        save_settings(settings); st.success("已更新"); time.sleep(0.5); st.rerun()
+                        save_json(SETTINGS_FILE, settings); st.success("已更新"); time.sleep(0.5); st.rerun()
                 with ic4:
                     if st.button("🗑️", key=f"del_{list_type}_{i}"):
                         if list_type == "item": settings["items"][global_project][cat_key].remove(item)
                         else: settings["locations"][global_project][cat_key].remove(item)
-                        save_settings(settings); st.rerun()
+                        save_json(SETTINGS_FILE, settings); st.rerun()
