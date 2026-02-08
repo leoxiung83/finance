@@ -381,47 +381,43 @@ with st.sidebar:
 
 tab_entry, tab_data, tab_dash, tab_settings = st.tabs(["📝 支出填寫", "📋 明細管理", "📊 收支儀表板", "⚙️ 設定與管理"])
 
-# --- Tab 1: 支出填寫 (全面導入 Form 優化) ---
+# --- Tab 1: 支出填寫 (優化版：選單與手動輸入並存，不自動重整) ---
 with tab_entry:
     st.info(f"📍 當前專案：{global_project} | 日期：{global_date} {day_str}")
     
-    # 預讀單價資料 (供參考，不自動帶入以避免 Form 衝突)
-    item_details = settings.get("item_details", {}).get(global_project, {})
-
     for conf in settings["cat_config"]:
         icon = "💰" if conf["type"] == "income" else "💸"
         
-        # 使用 Form 包裹每個類別，徹底解決輸入卡頓問題
+        # 使用 Form 來防止輸入時的頁面重整 (Running Man)
         with st.expander(f"{icon} {conf['display']}", expanded=False):
             with st.form(key=f"form_entry_{conf['key']}"):
                 col1, col2 = st.columns(2)
                 
-                # 選單資料
+                # 準備選單內容
                 items_list = settings["items"].get(global_project, {}).get(conf["key"], [])
-                items_with_manual = items_list + ["✏️ 手動輸入..."]
+                # 不再使用「✏️ 手動輸入...」選項，而是直接提供輸入框
                 
                 if conf["type"] == "income":
                     with col1:
-                        sel = st.selectbox("入帳來源", items_with_manual)
-                        man_val = ""
-                        if sel == "✏️ 手動輸入...": man_val = st.text_input("請輸入入帳來源")
+                        # 兩個欄位並存：選單 與 手動輸入
+                        sel = st.selectbox("入帳來源 (選單)", ["(請選擇)"] + items_list)
+                        man_val = st.text_input("或手動輸入來源 (若填寫則優先使用此欄位)")
                         price = st.number_input("入帳金額", min_value=0, step=100)
                     with col2:
                         buyer = st.text_input("收帳人 (經手人)")
                         note = st.text_area("備註", height=100)
-                    # 隱藏欄位
+                    # 隱藏預設值
                     sel_loc = ""; man_loc = ""; r_type = "無"; inv_no = ""; qty = 1; unit = "次"
                 else:
                     with col1:
-                        sel = st.selectbox("項目內容", items_with_manual)
-                        man_val = ""
-                        if sel == "✏️ 手動輸入...": man_val = st.text_input("請輸入項目名稱")
+                        # 兩個欄位並存
+                        sel = st.selectbox("項目內容 (選單)", ["(請選擇)"] + items_list)
+                        man_val = st.text_input("或手動輸入項目 (若填寫則優先使用此欄位)")
                         
                         locs_list = settings["locations"].get(global_project, {}).get(conf["key"], [])
-                        locs_with_manual = locs_list + ["✏️ 手動輸入..."]
-                        sel_loc = st.selectbox("購買地點", locs_with_manual)
-                        man_loc = ""
-                        if sel_loc == "✏️ 手動輸入...": man_loc = st.text_input("請輸入購買地點")
+                        sel_loc = st.selectbox("購買地點 (選單)", ["(請選擇)"] + locs_list)
+                        man_loc = st.text_input("或手動輸入地點")
+                        
                         buyer = st.text_input("購買人 (經手人)")
                     with col2:
                         r_type = st.radio("憑證類型", ["收據", "發票"], horizontal=True)
@@ -432,15 +428,20 @@ with tab_entry:
                         price = st.number_input("單價/金額", min_value=0, step=1)
                     note = st.text_input("備註")
 
-                # 送出按鈕 (此時才會連線)
+                # 送出按鈕 (此時才會連線運算)
                 submitted = st.form_submit_button("💾 儲存紀錄")
                 
                 if submitted:
-                    final_item = man_val if sel == "✏️ 手動輸入..." else sel
-                    final_loc = man_loc if conf["type"] != "income" and sel_loc == "✏️ 手動輸入..." else (sel_loc if conf["type"] != "income" else "")
+                    # 邏輯判斷：如果有手動輸入，就用手動的；否則用選單的
+                    final_item = man_val if man_val.strip() else (sel if sel != "(請選擇)" else "")
+                    
+                    if conf["type"] != "income":
+                        final_loc = man_loc if man_loc.strip() else (sel_loc if sel_loc != "(請選擇)" else "")
+                    else:
+                        final_loc = ""
                     
                     if not final_item:
-                        st.error("請輸入項目名稱！")
+                        st.error("❌ 請輸入或選擇項目名稱！")
                     else:
                         record = {
                             '日期': global_date, '專案': global_project, '類別': conf['key'], '項目內容': final_item,
@@ -450,9 +451,9 @@ with tab_entry:
                         with st.spinner("正在儲存..."):
                             if append_record(record):
                                 st.toast(f"✅ {conf['display']} 儲存成功！")
-                                time.sleep(0.5) # 讓使用者看到成功訊息
+                                time.sleep(0.5)
 
-# --- Tab 2: 明細管理 ---
+# --- Tab 2: 明細管理 (修正：刪除需確認) ---
 with tab_data:
     proj_df = df[df['專案'] == global_project].copy()
     if proj_df.empty: st.info("⚠️ 本專案尚無任何資料")
@@ -510,10 +511,20 @@ with tab_data:
                                 df_add = final_df.drop(columns=['刪除', '星期/節日'], errors='ignore')
                                 if save_dataframe(pd.concat([df_kept, df_add], ignore_index=True)): st.success("更新成功！"); time.sleep(1); st.rerun()
 
+                    # --- 刪除按鈕 (加入確認機制) ---
                     if c_btn2.button("🗑️ 刪除選取", key=f"btn_del_{conf['key']}"):
-                        if not edited_cat['刪除'].any(): st.warning("請勾選刪除項目")
-                        elif search_kw: st.error("搜尋模式下無法刪除")
+                        if not edited_cat['刪除'].any():
+                            st.warning("請先勾選要刪除的項目")
+                        elif search_kw:
+                            st.error("搜尋模式下無法執行刪除")
                         else:
+                            st.session_state[f"confirm_del_{conf['key']}"] = True # 設定確認狀態
+                    
+                    # 顯示確認警告
+                    if st.session_state.get(f"confirm_del_{conf['key']}"):
+                        st.warning("⚠️ 確定要永久刪除勾選的資料嗎？")
+                        col_yes, col_no = st.columns(2)
+                        if col_yes.button("✔️ 是，刪除", key=f"yes_{conf['key']}"):
                             with st.spinner("正在刪除..."):
                                 rows_keep = edited_cat[edited_cat['刪除'] == False].copy()
                                 current_full_df = df
@@ -523,7 +534,14 @@ with tab_data:
                                 df_add = rows_keep.drop(columns=['刪除', '星期/節日'], errors='ignore')
                                 df_add['類別'] = conf['key']; df_add['專案'] = global_project
                                 df_add['總價'] = pd.to_numeric(df_add['數量'], errors='coerce') * pd.to_numeric(df_add['單價'], errors='coerce')
-                                if save_dataframe(pd.concat([df_kept, df_add], ignore_index=True)): st.success("已刪除"); time.sleep(1); st.rerun()
+                                if save_dataframe(pd.concat([df_kept, df_add], ignore_index=True)):
+                                    st.success("已刪除"); 
+                                    st.session_state[f"confirm_del_{conf['key']}"] = False # 重置
+                                    time.sleep(1); st.rerun()
+                        if col_no.button("❌ 否，取消", key=f"no_{conf['key']}"):
+                            st.session_state[f"confirm_del_{conf['key']}"] = False
+                            st.rerun()
+                            
                     st.markdown("---")
 
 # --- Tab 3: 收支儀表板 (含分類統計表) ---
