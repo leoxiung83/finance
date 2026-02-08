@@ -18,13 +18,17 @@ except ImportError:
     HAS_GOOGLE_LIB = False
 
 # --- PDF 報表相關套件 ---
-from reportlab.lib.pagesizes import A4
-from reportlab.lib import colors
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.lib.units import cm
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.lib.units import cm
+except ImportError:
+    st.error("❌ 系統缺少 'reportlab' 套件。請確認 requirements.txt 已包含 reportlab。")
+    st.stop()
 
 st.set_page_config(page_title="勁翔營造 工地計帳系統", layout="wide", page_icon="🏗️")
 
@@ -35,10 +39,16 @@ FONT_FILE = 'kaiu.ttf'
 FONT_NAME = 'Kaiu'
 
 # --- 判斷執行模式 (關鍵邏輯) ---
-# 如果有安裝 gspread 且 讀得到 secrets，就用雲端模式；否則用本地 CSV 模式
 def check_mode():
-    if HAS_GOOGLE_LIB and "gcp_service_account" in st.secrets:
-        return "cloud"
+    # 1. 檢查有沒有安裝套件
+    if not HAS_GOOGLE_LIB:
+        return "local"
+    # 2. 檢查有沒有 Secrets 設定 (防呆)
+    try:
+        if "gcp_service_account" in st.secrets:
+            return "cloud"
+    except:
+        pass
     return "local"
 
 MODE = check_mode()
@@ -64,7 +74,7 @@ DEFAULT_CAT_CONFIG = [
 ]
 
 # ==========================================
-# 1. 資料存取層 (Data Access Layer)
+# 1. 資料存取層
 # ==========================================
 
 def get_gsheet_client():
@@ -83,21 +93,21 @@ def load_data():
             sheet = client.open("FinanceData").sheet1
             data = sheet.get_all_records()
             df = pd.DataFrame(data) if data else pd.DataFrame(columns=cols)
-            # 補齊欄位
             for c in cols:
                 if c not in df.columns: df[c] = ""
         except Exception as e:
-            st.error(f"雲端連線失敗，切換至暫存模式: {e}")
+            st.warning(f"雲端連線異常 ({e})，切換至暫存檢視模式。")
             return pd.DataFrame(columns=cols)
     else:
-        # 本地模式
         if os.path.exists(DATA_FILE):
-            df = pd.read_csv(DATA_FILE)
+            try:
+                df = pd.read_csv(DATA_FILE)
+            except:
+                df = pd.DataFrame(columns=cols)
         else:
             df = pd.DataFrame(columns=cols)
             df.to_csv(DATA_FILE, index=False, encoding='utf-8-sig')
 
-    # 共同格式處理
     text_cols = ['發票號碼', '備註', '購買地點', '經手人', '項目內容', '專案', '類別', '單位', '憑證類型']
     for col in text_cols:
         if col in df.columns: df[col] = df[col].fillna("").astype(str)
@@ -110,7 +120,6 @@ def load_data():
 
 def save_dataframe(df):
     try:
-        # 移除輔助欄位
         cols_to_drop = ['月份', 'Year', 'temp_month', '刪除', '星期/節日']
         df_save = df.drop(columns=[c for c in cols_to_drop if c in df.columns])
         
@@ -150,7 +159,6 @@ def load_settings():
         if os.path.exists(SETTINGS_FILE):
             with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
                 return json.load(f)
-                
     return default
 
 def save_settings(data):
@@ -161,7 +169,7 @@ def save_settings(data):
                 ws = client.open("FinanceData").worksheet("Settings")
                 ws.update('A1', [[json.dumps(data, ensure_ascii=False)]])
             except:
-                st.warning("雲端無 'Settings' 分頁，設定無法儲存。")
+                st.warning("雲端無 'Settings' 分頁。")
     else:
         with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
@@ -171,7 +179,6 @@ def append_record(record_dict):
         try:
             client = get_gsheet_client()
             sheet = client.open("FinanceData").sheet1
-            # 順序必須對應
             row = [
                 str(record_dict['日期']), record_dict['專案'], record_dict['類別'], record_dict['項目內容'],
                 record_dict['單位'], record_dict['數量'], record_dict['單價'], record_dict['總價'],
@@ -191,10 +198,8 @@ def append_record(record_dict):
 def create_zip_backup(df, settings, target_project):
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-        # 資料部分
         if target_project and target_project != "所有專案 (完整系統)":
             df_out = df[df['專案'] == target_project] if not df.empty else df
-            # 設定檔部分需過濾
             s_out = {
                 "projects": [target_project],
                 "cat_config": settings.get("cat_config", DEFAULT_CAT_CONFIG),
@@ -209,22 +214,8 @@ def create_zip_backup(df, settings, target_project):
         df_out.to_csv(csv_buffer, index=False, encoding='utf-8-sig')
         zip_file.writestr('finance_data.csv', csv_buffer.getvalue())
         zip_file.writestr('finance_settings.json', json.dumps(s_out, ensure_ascii=False, indent=4))
-        
     buffer.seek(0)
     return buffer
-
-# --- 輔助函式 ---
-def get_date_info(date_obj):
-    if isinstance(date_obj, str):
-        try: date_obj = datetime.strptime(date_obj, "%Y-%m-%d").date()
-        except: return "", False
-    weekdays = ["(週一)", "(週二)", "(週三)", "(週四)", "(週五)", "(週六)", "(週日)"]
-    w_str = weekdays[date_obj.weekday()]
-    date_str = date_obj.strftime("%Y-%m-%d")
-    is_weekend = date_obj.weekday() >= 5
-    if date_str in HOLIDAYS: return f"🔴 {w_str} ★{HOLIDAYS[date_str]}", True 
-    if is_weekend: return f"🔴 {w_str}", True 
-    return f"{w_str}", False
 
 # --- PDF 生成 ---
 def generate_pdf_report(df, project_name, year, month):
@@ -234,7 +225,7 @@ def generate_pdf_report(df, project_name, year, month):
     font_path = FONT_FILE 
     if not os.path.exists(font_path):
         font_main = 'Helvetica'; font_bold = 'Helvetica-Bold'
-        st.toast(f"⚠️ 找不到 {FONT_FILE}，使用預設字型。")
+        # 在雲端若無字型檔，嘗試使用內建 (不報錯但中文會亂碼)
     else:
         try:
             pdfmetrics.registerFont(TTFont(FONT_NAME, font_path))
@@ -323,9 +314,9 @@ df = load_data()
 
 st.title("🏗️ 勁翔營造 工地計帳系統")
 if MODE == "local":
-    st.warning("⚠️ 單機模式：資料僅儲存於電腦 (finance_data.csv)，未同步至雲端。")
+    st.info("💻 目前為單機模式 (資料存於 finance_data.csv)")
 else:
-    st.success("☁️ 雲端連線模式：資料同步儲存於 Google Sheets。")
+    st.info("☁️ 目前為雲端模式 (資料存於 Google Sheets)")
 
 if 'last_check_date' not in st.session_state:
     st.session_state.last_check_date = datetime.now().date()
@@ -391,7 +382,7 @@ with tab_entry:
         icon = "💰" if conf["type"] == "income" else "💸"
         k_sel = f"sel_{conf['key']}"; k_man = f"man_{conf['key']}"; k_price = f"price_{conf['key']}"
         k_buyer = f"buyer_{conf['key']}"; k_note = f"note_{conf['key']}"; k_sel_loc = f"sel_loc_{conf['key']}"
-        k_man_loc = f"man_loc_{conf['key']}"; k_type = f"type_{conf['key']}"; k_inv = f"inv_{conf['key']}"
+        k_man_loc = f"man_loc_{conf_key}"; k_type = f"type_{conf['key']}"; k_inv = f"inv_{conf['key']}"
         k_qty = f"qty_{conf['key']}"; k_unit = f"unit_{conf['key']}"
         if k_man not in st.session_state: st.session_state[k_man] = ""
         if k_price not in st.session_state: st.session_state[k_price] = 0
@@ -496,7 +487,6 @@ with tab_data:
                                 if sel_month != "整年": mask = mask & (current_full_df['月份'] == sel_month)
                                 df_kept = current_full_df[~mask]
                                 df_add = rows_keep.drop(columns=['刪除', '星期/節日'], errors='ignore')
-                                # 補齊必要欄位避免錯誤
                                 df_add['類別'] = conf['key']; df_add['專案'] = global_project
                                 df_add['總價'] = pd.to_numeric(df_add['數量'], errors='coerce') * pd.to_numeric(df_add['單價'], errors='coerce')
                                 if save_dataframe(pd.concat([df_kept, df_add], ignore_index=True)): st.success("已刪除"); time.sleep(1); st.rerun()
@@ -533,7 +523,7 @@ with tab_dash:
             file_name = f"財務報表_{global_project}_{rpt_sel_year}_{rpt_sel_month}.pdf"
             st.download_button("📥 點此下載 PDF", data=pdf_data, file_name=file_name, mime="application/pdf")
 
-# --- Tab 4: 設定與管理 (全功能回歸) ---
+# --- Tab 4: 設定與管理 (全功能) ---
 with tab_settings:
     st.header("⚙️ 設定與管理")
     st.markdown("### 一、專案管理")
