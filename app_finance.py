@@ -83,7 +83,7 @@ def get_gsheet_client():
     except:
         return None
 
-@st.cache_data(ttl=10)
+@st.cache_data(ttl=60) # 稍微延長快取時間，減少自動重讀的頻率，依賴手動重新整理
 def load_data():
     cols = ['日期', '專案', '類別', '項目內容', '單位', '數量', '單價', '總價', '購買地點', '經手人', '憑證類型', '發票號碼', '備註', '月份', 'Year']
     
@@ -351,6 +351,12 @@ if 'last_check_date' not in st.session_state:
     st.session_state.last_check_date = datetime.now().date()
 
 with st.sidebar:
+    # --- 新增：手動重新整理按鈕 ---
+    if st.button("🔄 強制重新整理資料 (若雲端有更新)", use_container_width=True):
+        load_data.clear()
+        st.rerun()
+    st.divider()
+    
     st.header("📅 專案選擇")
     if not settings["projects"]: settings["projects"] = ["預設專案"]
     current_proj_idx = 0
@@ -453,7 +459,7 @@ with tab_entry:
                                 st.toast(f"✅ {conf['display']} 儲存成功！")
                                 time.sleep(0.5)
 
-# --- Tab 2: 明細管理 (修正：刪除需確認) ---
+# --- Tab 2: 明細管理 (修正：刪除需確認 & 隱藏 Index) ---
 with tab_data:
     proj_df = df[df['專案'] == global_project].copy()
     if proj_df.empty: st.info("⚠️ 本專案尚無任何資料")
@@ -492,6 +498,7 @@ with tab_data:
                     else:
                         col_config = {"刪除": st.column_config.CheckboxColumn(width="small"), "總價": st.column_config.NumberColumn(format="$%d", disabled=True), "日期": st.column_config.DateColumn(format="YYYY-MM-DD", width="small"), "星期/節日": st.column_config.TextColumn(disabled=True, width="small")}
                     
+                    # 關鍵修正：加入 hide_index=True
                     edited_cat = st.data_editor(cat_df.sort_values('日期', ascending=False), column_config=col_config, use_container_width=True, num_rows="dynamic", key=f"editor_{conf['key']}_{sel_year}_{sel_month}", hide_index=True)
                     
                     c_btn1, c_btn2, _ = st.columns([1, 1, 4])
