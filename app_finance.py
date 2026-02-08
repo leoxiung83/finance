@@ -9,7 +9,10 @@ from datetime import datetime
 import zipfile
 import io
 
-# --- 嘗試匯入雲端套件 (本地沒有也不會報錯) ---
+# 設定頁面
+st.set_page_config(page_title="勁翔營造 工地計帳系統", layout="wide", page_icon="🏗️")
+
+# --- 1. 安全匯入機制 (防止崩潰) ---
 try:
     import gspread
     from oauth2client.service_account import ServiceAccountCredentials
@@ -17,7 +20,6 @@ try:
 except ImportError:
     HAS_GOOGLE_LIB = False
 
-# --- PDF 報表相關套件 ---
 try:
     from reportlab.lib.pagesizes import A4
     from reportlab.lib import colors
@@ -26,11 +28,9 @@ try:
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
     from reportlab.lib.units import cm
+    HAS_PDF_LIB = True
 except ImportError:
-    st.error("❌ 系統缺少 'reportlab' 套件。請確認 requirements.txt 已包含 reportlab。")
-    st.stop()
-
-st.set_page_config(page_title="勁翔營造 工地計帳系統", layout="wide", page_icon="🏗️")
+    HAS_PDF_LIB = False
 
 # --- 檔案與字型設定 ---
 DATA_FILE = 'finance_data.csv'
@@ -38,17 +38,16 @@ SETTINGS_FILE = 'finance_settings.json'
 FONT_FILE = 'kaiu.ttf' 
 FONT_NAME = 'Kaiu'
 
-# --- 判斷執行模式 (關鍵邏輯) ---
+# --- 判斷執行模式 ---
 def check_mode():
-    # 1. 檢查有沒有安裝套件
-    if not HAS_GOOGLE_LIB:
-        return "local"
-    # 2. 檢查有沒有 Secrets 設定 (防呆)
-    try:
-        if "gcp_service_account" in st.secrets:
-            return "cloud"
-    except:
-        pass
+    # 優先檢查是否具備雲端條件
+    if HAS_GOOGLE_LIB:
+        try:
+            # 檢查 secrets 是否存在 (Streamlit Cloud 或本地 .streamlit/secrets.toml)
+            if "gcp_service_account" in st.secrets:
+                return "cloud"
+        except:
+            pass
     return "local"
 
 MODE = check_mode()
@@ -96,9 +95,10 @@ def load_data():
             for c in cols:
                 if c not in df.columns: df[c] = ""
         except Exception as e:
-            st.warning(f"雲端連線異常 ({e})，切換至暫存檢視模式。")
+            st.warning(f"⚠️ 雲端讀取異常 ({e})，切換至暫存模式。")
             return pd.DataFrame(columns=cols)
     else:
+        # 本地模式
         if os.path.exists(DATA_FILE):
             try:
                 df = pd.read_csv(DATA_FILE)
@@ -217,15 +217,32 @@ def create_zip_backup(df, settings, target_project):
     buffer.seek(0)
     return buffer
 
-# --- PDF 生成 ---
+def get_date_info(date_obj):
+    if isinstance(date_obj, str):
+        try: date_obj = datetime.strptime(date_obj, "%Y-%m-%d").date()
+        except: return "", False
+    weekdays = ["(週一)", "(週二)", "(週三)", "(週四)", "(週五)", "(週六)", "(週日)"]
+    w_str = weekdays[date_obj.weekday()]
+    date_str = date_obj.strftime("%Y-%m-%d")
+    is_weekend = date_obj.weekday() >= 5
+    if date_str in HOLIDAYS: return f"🔴 {w_str} ★{HOLIDAYS[date_str]}", True 
+    if is_weekend: return f"🔴 {w_str}", True 
+    return f"{w_str}", False
+
+# --- PDF 生成 (安全版) ---
 def generate_pdf_report(df, project_name, year, month):
+    if not HAS_PDF_LIB:
+        st.error("系統缺少 'reportlab' 套件，無法產生 PDF。請確認 requirements.txt。")
+        return None
+        
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=1.0*cm, leftMargin=1.0*cm, topMargin=1.5*cm, bottomMargin=1.5*cm)
     
     font_path = FONT_FILE 
     if not os.path.exists(font_path):
         font_main = 'Helvetica'; font_bold = 'Helvetica-Bold'
-        # 在雲端若無字型檔，嘗試使用內建 (不報錯但中文會亂碼)
+        # 若雲端缺少字型，顯示提示但不中斷
+        st.toast(f"⚠️ 找不到 {FONT_FILE}，報表將使用預設字型 (中文可能無法顯示)。")
     else:
         try:
             pdfmetrics.registerFont(TTFont(FONT_NAME, font_path))
@@ -314,9 +331,14 @@ df = load_data()
 
 st.title("🏗️ 勁翔營造 工地計帳系統")
 if MODE == "local":
-    st.info("💻 目前為單機模式 (資料存於 finance_data.csv)")
+    if not HAS_GOOGLE_LIB:
+        st.warning("⚠️ 單機模式 (缺少 gspread 套件，無法連線 Google Sheets)")
+    elif "gcp_service_account" not in st.secrets:
+        st.warning("⚠️ 單機模式 (未偵測到 Secrets 金鑰)")
+    else:
+        st.info("💻 單機模式 (連線失敗，使用本地 CSV)")
 else:
-    st.info("☁️ 目前為雲端模式 (資料存於 Google Sheets)")
+    st.toast("☁️ 雲端連線模式：資料同步儲存於 Google Sheets")
 
 if 'last_check_date' not in st.session_state:
     st.session_state.last_check_date = datetime.now().date()
@@ -520,8 +542,9 @@ with tab_dash:
             rpt_df = rpt_data_y.copy()
             if rpt_sel_month != "整年度": rpt_df = rpt_df[rpt_df['月份'] == rpt_sel_month]
             pdf_data = generate_pdf_report(rpt_df, global_project, rpt_sel_year, rpt_sel_month)
-            file_name = f"財務報表_{global_project}_{rpt_sel_year}_{rpt_sel_month}.pdf"
-            st.download_button("📥 點此下載 PDF", data=pdf_data, file_name=file_name, mime="application/pdf")
+            if pdf_data:
+                file_name = f"財務報表_{global_project}_{rpt_sel_year}_{rpt_sel_month}.pdf"
+                st.download_button("📥 點此下載 PDF", data=pdf_data, file_name=file_name, mime="application/pdf")
 
 # --- Tab 4: 設定與管理 (全功能) ---
 with tab_settings:
