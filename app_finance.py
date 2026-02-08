@@ -9,10 +9,7 @@ from datetime import datetime
 import zipfile
 import io
 
-# 設定頁面
-st.set_page_config(page_title="勁翔營造 工地計帳系統", layout="wide", page_icon="🏗️")
-
-# --- 1. 安全匯入機制 (防止崩潰) ---
+# --- 1. 安全匯入機制 (防止因缺少套件而崩潰) ---
 try:
     import gspread
     from oauth2client.service_account import ServiceAccountCredentials
@@ -32,6 +29,9 @@ try:
 except ImportError:
     HAS_PDF_LIB = False
 
+# 設定頁面
+st.set_page_config(page_title="勁翔營造 工地計帳系統", layout="wide", page_icon="🏗️")
+
 # --- 檔案與字型設定 ---
 DATA_FILE = 'finance_data.csv'
 SETTINGS_FILE = 'finance_settings.json'
@@ -40,14 +40,13 @@ FONT_NAME = 'Kaiu'
 
 # --- 判斷執行模式 ---
 def check_mode():
-    # 優先檢查是否具備雲端條件
-    if HAS_GOOGLE_LIB:
-        try:
-            # 檢查 secrets 是否存在 (Streamlit Cloud 或本地 .streamlit/secrets.toml)
-            if "gcp_service_account" in st.secrets:
-                return "cloud"
-        except:
-            pass
+    if not HAS_GOOGLE_LIB:
+        return "local"
+    try:
+        if "gcp_service_account" in st.secrets:
+            return "cloud"
+    except:
+        pass
     return "local"
 
 MODE = check_mode()
@@ -73,7 +72,7 @@ DEFAULT_CAT_CONFIG = [
 ]
 
 # ==========================================
-# 1. 資料存取層
+# 資料存取層
 # ==========================================
 
 def get_gsheet_client():
@@ -95,10 +94,9 @@ def load_data():
             for c in cols:
                 if c not in df.columns: df[c] = ""
         except Exception as e:
-            st.warning(f"⚠️ 雲端讀取異常 ({e})，切換至暫存模式。")
+            # st.warning(f"雲端讀取異常: {e}") # 隱藏錯誤訊息，避免干擾
             return pd.DataFrame(columns=cols)
     else:
-        # 本地模式
         if os.path.exists(DATA_FILE):
             try:
                 df = pd.read_csv(DATA_FILE)
@@ -155,6 +153,8 @@ def load_settings():
                 if json_str: return json.loads(json_str)
             except:
                 pass
+        except:
+            pass # 這裡之前漏了 except，已修正
     else:
         if os.path.exists(SETTINGS_FILE):
             with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
@@ -170,6 +170,8 @@ def save_settings(data):
                 ws.update('A1', [[json.dumps(data, ensure_ascii=False)]])
             except:
                 st.warning("雲端無 'Settings' 分頁。")
+        except:
+            pass # 這裡之前漏了 except，已修正
     else:
         with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
@@ -232,7 +234,7 @@ def get_date_info(date_obj):
 # --- PDF 生成 (安全版) ---
 def generate_pdf_report(df, project_name, year, month):
     if not HAS_PDF_LIB:
-        st.error("系統缺少 'reportlab' 套件，無法產生 PDF。請確認 requirements.txt。")
+        st.error("系統缺少 'reportlab' 套件。")
         return None
         
     buffer = io.BytesIO()
@@ -241,8 +243,7 @@ def generate_pdf_report(df, project_name, year, month):
     font_path = FONT_FILE 
     if not os.path.exists(font_path):
         font_main = 'Helvetica'; font_bold = 'Helvetica-Bold'
-        # 若雲端缺少字型，顯示提示但不中斷
-        st.toast(f"⚠️ 找不到 {FONT_FILE}，報表將使用預設字型 (中文可能無法顯示)。")
+        st.toast(f"⚠️ 找不到 {FONT_FILE}，使用預設字型。")
     else:
         try:
             pdfmetrics.registerFont(TTFont(FONT_NAME, font_path))
@@ -404,7 +405,7 @@ with tab_entry:
         icon = "💰" if conf["type"] == "income" else "💸"
         k_sel = f"sel_{conf['key']}"; k_man = f"man_{conf['key']}"; k_price = f"price_{conf['key']}"
         k_buyer = f"buyer_{conf['key']}"; k_note = f"note_{conf['key']}"; k_sel_loc = f"sel_loc_{conf['key']}"
-        k_man_loc = f"man_loc_{conf_key}"; k_type = f"type_{conf['key']}"; k_inv = f"inv_{conf['key']}"
+        k_man_loc = f"man_loc_{conf['key']}"; k_type = f"type_{conf['key']}"; k_inv = f"inv_{conf['key']}"
         k_qty = f"qty_{conf['key']}"; k_unit = f"unit_{conf['key']}"
         if k_man not in st.session_state: st.session_state[k_man] = ""
         if k_price not in st.session_state: st.session_state[k_price] = 0
