@@ -69,10 +69,9 @@ DEFAULT_CAT_CONFIG = [
 ]
 
 # ==========================================
-# 1. 資料存取層 (Backend) - 極致順暢化
+# 1. 資料存取層 (Backend)
 # ==========================================
 
-# 使用 cache_resource 鎖定連線物件，解決輸入卡頓與重複連線訊息問題
 @st.cache_resource
 def get_gsheet_client():
     if not HAS_GOOGLE_LIB: return None
@@ -97,7 +96,6 @@ def load_data():
                 df = pd.DataFrame(data) if data else pd.DataFrame(columns=cols)
                 for c in cols:
                     if c not in df.columns: df[c] = ""
-                # 格式化
                 text_cols = ['發票號碼', '備註', '購買地點', '經手人', '項目內容', '專案', '類別', '單位', '憑證類型']
                 for col in text_cols:
                     if col in df.columns: df[col] = df[col].fillna("").astype(str)
@@ -109,7 +107,6 @@ def load_data():
         except:
             pass 
             
-    # Local Mode
     if os.path.exists(DATA_FILE):
         try:
             df = pd.read_csv(DATA_FILE)
@@ -155,9 +152,8 @@ def load_settings():
         "items": {"預設專案": {c["key"]: [] for c in DEFAULT_CAT_CONFIG}},
         "locations": {"預設專案": {c["key"]: [] for c in DEFAULT_CAT_CONFIG}},
         "cat_config": DEFAULT_CAT_CONFIG,
-        "item_details": {} # 新增：用來儲存單價與單位的結構
+        "item_details": {}
     }
-    
     settings = default
     if MODE == "cloud":
         try:
@@ -172,7 +168,8 @@ def load_settings():
             with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
                 settings = json.load(f)
     
-    # 確保資料結構完整
+    # 確保資料結構
+    if "cat_config" not in settings: settings["cat_config"] = DEFAULT_CAT_CONFIG
     if "item_details" not in settings: settings["item_details"] = {}
     return settings
 
@@ -217,7 +214,6 @@ def create_zip_backup(df, settings, target_project):
     with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
         if target_project and target_project != "所有專案 (完整系統)":
             df_out = df[df['專案'] == target_project] if not df.empty else df
-            # 過濾設定
             s_out = {
                 "projects": [target_project],
                 "cat_config": settings.get("cat_config", DEFAULT_CAT_CONFIG),
@@ -420,7 +416,6 @@ with tab_entry:
         with st.spinner("正在儲存..."):
             if append_record(record):
                 st.toast(f"✅ {display_name} 儲存成功！")
-                # 清空欄位
                 st.session_state[k_man] = ""; st.session_state[k_price] = 0; st.session_state[k_note] = ""; st.session_state[k_buyer] = ""
                 if conf_type != "income": st.session_state[k_man_loc] = ""; st.session_state[k_inv] = ""; st.session_state[k_qty] = 1.0
 
@@ -442,7 +437,6 @@ with tab_entry:
             items_with_manual = items_list + ["✏️ 手動輸入..."]
             
             # --- Auto-fill Logic ---
-            # 為了讓 Tab 4 設定的預設價格能自動帶入
             def update_defaults(key_sel, key_price, key_unit):
                 sel_item = st.session_state.get(key_sel)
                 if sel_item and sel_item in item_details:
@@ -691,7 +685,7 @@ with tab_settings:
                     save_settings(settings); st.rerun()
         for i, c in enumerate(settings["cat_config"]):
             c1, c2, c3 = st.columns([3, 1, 1])
-            with c1: new_disp = st.text_input(f"名稱 {i}", c['display'], key=f"rn_{i}", label_visibility="collapsed")
+            with c1: new_disp = st.text_input(f"名稱 {i}", c['display'], key=f"cat_rn_{i}", label_visibility="collapsed")
             with c2: 
                 if st.button("更", key=f"up_{i}"): 
                     settings["cat_config"][i]["display"] = new_disp; save_settings(settings); st.rerun()
@@ -752,13 +746,13 @@ with tab_settings:
                     # 取得目前設定值
                     curr_detail = settings["item_details"][global_project].get(it, {"price": 0, "unit": "式"})
                     
-                    with ic1: rn = st.text_input("N", it, key=f"rn_{i}", label_visibility="collapsed")
-                    with ic2: rp = st.number_input("P", value=int(curr_detail["price"]), step=100, key=f"rp_{i}", label_visibility="collapsed")
-                    with ic3: ru = st.text_input("U", value=curr_detail["unit"], key=f"ru_{i}", label_visibility="collapsed")
+                    with ic1: rn = st.text_input("N", it, key=f"item_rn_{i}", label_visibility="collapsed")
+                    with ic2: rp = st.number_input("P", value=int(curr_detail["price"]), step=100, key=f"item_rp_{i}", label_visibility="collapsed")
+                    with ic3: ru = st.text_input("U", value=curr_detail["unit"], key=f"item_ru_{i}", label_visibility="collapsed")
                     
                     # 儲存邏輯
                     with ic4:
-                        if st.button("💾", key=f"sv_{i}"):
+                        if st.button("💾", key=f"item_sv_{i}"):
                             # 1. 更新名稱
                             if rn != it:
                                 settings["items"][global_project][c_key][i] = rn
@@ -780,9 +774,9 @@ with tab_settings:
                         if del_sub_key not in st.session_state: st.session_state[del_sub_key] = False
                         
                         if not st.session_state[del_sub_key]:
-                            if st.button("🗑️", key=f"rm_{i}"): st.session_state[del_sub_key] = True; st.rerun()
+                            if st.button("🗑️", key=f"item_rm_{i}"): st.session_state[del_sub_key] = True; st.rerun()
                         else:
-                            if st.button("✔️", key=f"yes_{i}"):
+                            if st.button("✔️", key=f"item_yes_{i}"):
                                 settings["items"][global_project][c_key].remove(it)
                                 if it in settings["item_details"][global_project]:
                                     del settings["item_details"][global_project][it]
