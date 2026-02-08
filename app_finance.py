@@ -387,11 +387,14 @@ with st.sidebar:
 
 tab_entry, tab_data, tab_dash, tab_settings = st.tabs(["📝 支出填寫", "📋 明細管理", "📊 收支儀表板", "⚙️ 設定與管理"])
 
+# 取得目前專案的獨立設定
+current_cat_config = settings["cat_config"][global_project]
+
 # --- Tab 1: 支出填寫 (優化版：選單與手動輸入並存，不自動重整) ---
 with tab_entry:
     st.info(f"📍 當前專案：{global_project} | 日期：{global_date} {day_str}")
     
-    for conf in settings["cat_config"]:
+    for conf in current_cat_config: # 使用專案獨立設定
         icon = "💰" if conf["type"] == "income" else "💸"
         
         # 使用 Form 來防止輸入時的頁面重整 (Running Man)
@@ -401,7 +404,6 @@ with tab_entry:
                 
                 # 準備選單內容
                 items_list = settings["items"].get(global_project, {}).get(conf["key"], [])
-                # 不再使用「✏️ 手動輸入...」選項，而是直接提供輸入框
                 
                 if conf["type"] == "income":
                     with col1:
@@ -459,7 +461,7 @@ with tab_entry:
                                 st.toast(f"✅ {conf['display']} 儲存成功！")
                                 time.sleep(0.5)
 
-# --- Tab 2: 明細管理 (修正：刪除需確認 & 隱藏 Index) ---
+# --- Tab 2: 明細管理 (修正：使用 st.form 包裹 st.data_editor 防止勾選時自動重整) ---
 with tab_data:
     proj_df = df[df['專案'] == global_project].copy()
     if proj_df.empty: st.info("⚠️ 本專案尚無任何資料")
@@ -479,7 +481,7 @@ with tab_data:
         st.divider()
         if view_df.empty: st.warning("查無符合條件的資料")
         else:
-            for conf in settings["cat_config"]:
+            for conf in current_cat_config: # 使用專案獨立設定
                 cat_df = view_df[view_df['類別'] == conf['key']].copy()
                 cat_df['總價'] = pd.to_numeric(cat_df['總價'], errors='coerce').fillna(0)
                 subtotal = cat_df['總價'].sum()
@@ -498,11 +500,20 @@ with tab_data:
                     else:
                         col_config = {"刪除": st.column_config.CheckboxColumn(width="small"), "總價": st.column_config.NumberColumn(format="$%d", disabled=True), "日期": st.column_config.DateColumn(format="YYYY-MM-DD", width="small"), "星期/節日": st.column_config.TextColumn(disabled=True, width="small")}
                     
-                    # 關鍵修正：加入 hide_index=True
-                    edited_cat = st.data_editor(cat_df.sort_values('日期', ascending=False).reset_index(drop=True), column_config=col_config, use_container_width=True, num_rows="dynamic", key=f"editor_{conf['key']}_{sel_year}_{sel_month}", hide_index=True)
+                    # --- 使用 FORM 包裹表格與按鈕，解決勾選時小人跑動問題 ---
+                    with st.form(key=f"form_editor_{conf['key']}"):
+                        # 關鍵修正：加入 hide_index=True 並重置索引
+                        edited_cat = st.data_editor(cat_df.sort_values('日期', ascending=False).reset_index(drop=True), column_config=col_config, use_container_width=True, num_rows="dynamic", key=f"editor_{conf['key']}_{sel_year}_{sel_month}", hide_index=True)
+                        
+                        c_btn1, c_btn2, _ = st.columns([1, 1, 4])
+                        # 使用 form_submit_button
+                        with c_btn1:
+                            submit_update = st.form_submit_button("💾 更新修改")
+                        with c_btn2:
+                            submit_delete = st.form_submit_button("🗑️ 刪除選取")
                     
-                    c_btn1, c_btn2, _ = st.columns([1, 1, 4])
-                    if c_btn1.button("💾 更新修改", key=f"btn_upd_{conf['key']}"):
+                    # --- 處理按鈕邏輯 (在 Form 外部處理) ---
+                    if submit_update:
                         if search_kw: st.error("搜尋模式下無法存檔！")
                         else:
                             with st.spinner("正在更新資料庫..."):
@@ -518,40 +529,53 @@ with tab_data:
                                 df_add = final_df.drop(columns=['刪除', '星期/節日'], errors='ignore')
                                 if save_dataframe(pd.concat([df_kept, df_add], ignore_index=True)): st.success("更新成功！"); time.sleep(1); st.rerun()
 
-                    # --- 刪除按鈕 (加入確認機制) ---
-                    if c_btn2.button("🗑️ 刪除選取", key=f"btn_del_{conf['key']}"):
+                    # --- 刪除按鈕邏輯 (檢查勾選並設定 Session State) ---
+                    if submit_delete:
                         if not edited_cat['刪除'].any():
                             st.warning("請先勾選要刪除的項目")
                         elif search_kw:
                             st.error("搜尋模式下無法執行刪除")
                         else:
-                            st.session_state[f"confirm_del_{conf['key']}"] = True # 設定確認狀態
+                            # 將要刪除的資料暫存到 Session State，並開啟確認模式
+                            st.session_state[f"pending_del_df_{conf['key']}"] = edited_cat
+                            st.session_state[f"confirm_del_{conf['key']}"] = True
+                            st.rerun() # 強制重整以顯示下方的確認框
                     
-                    # 顯示確認警告
+                    # --- 顯示確認警告 (在 Form 外部顯示) ---
                     if st.session_state.get(f"confirm_del_{conf['key']}"):
                         st.warning("⚠️ 確定要永久刪除勾選的資料嗎？")
                         col_yes, col_no = st.columns(2)
+                        
                         if col_yes.button("✔️ 是，刪除", key=f"yes_{conf['key']}"):
-                            with st.spinner("正在刪除..."):
-                                rows_keep = edited_cat[edited_cat['刪除'] == False].copy()
-                                current_full_df = df
-                                mask = (current_full_df['專案'] == global_project) & (current_full_df['類別'] == conf['key']) & (current_full_df['Year'] == sel_year)
-                                if sel_month != "整年": mask = mask & (current_full_df['月份'] == sel_month)
-                                df_kept = current_full_df[~mask]
-                                df_add = rows_keep.drop(columns=['刪除', '星期/節日'], errors='ignore')
-                                df_add['類別'] = conf['key']; df_add['專案'] = global_project
-                                df_add['總價'] = pd.to_numeric(df_add['數量'], errors='coerce') * pd.to_numeric(df_add['單價'], errors='coerce')
-                                if save_dataframe(pd.concat([df_kept, df_add], ignore_index=True)):
-                                    st.success("已刪除"); 
-                                    st.session_state[f"confirm_del_{conf['key']}"] = False # 重置
-                                    time.sleep(1); st.rerun()
+                            # 從 Session State 取回暫存的資料表
+                            pending_df = st.session_state.get(f"pending_del_df_{conf['key']}")
+                            if pending_df is not None:
+                                with st.spinner("正在刪除..."):
+                                    rows_keep = pending_df[pending_df['刪除'] == False].copy()
+                                    current_full_df = df
+                                    mask = (current_full_df['專案'] == global_project) & (current_full_df['類別'] == conf['key']) & (current_full_df['Year'] == sel_year)
+                                    if sel_month != "整年": mask = mask & (current_full_df['月份'] == sel_month)
+                                    df_kept = current_full_df[~mask]
+                                    df_add = rows_keep.drop(columns=['刪除', '星期/節日'], errors='ignore')
+                                    df_add['類別'] = conf['key']; df_add['專案'] = global_project
+                                    df_add['總價'] = pd.to_numeric(df_add['數量'], errors='coerce') * pd.to_numeric(df_add['單價'], errors='coerce')
+                                    
+                                    if save_dataframe(pd.concat([df_kept, df_add], ignore_index=True)):
+                                        st.success("已刪除"); 
+                                        # 清除狀態
+                                        st.session_state[f"confirm_del_{conf['key']}"] = False
+                                        del st.session_state[f"pending_del_df_{conf['key']}"]
+                                        time.sleep(1); st.rerun()
+                                        
                         if col_no.button("❌ 否，取消", key=f"no_{conf['key']}"):
                             st.session_state[f"confirm_del_{conf['key']}"] = False
+                            if f"pending_del_df_{conf['key']}" in st.session_state:
+                                del st.session_state[f"pending_del_df_{conf['key']}"]
                             st.rerun()
                             
                     st.markdown("---")
 
-# --- Tab 3: 收支儀表板 (含分類統計表) ---
+# --- Tab 3: 收支儀表板 (含分類統計表 & 正確類別名稱顯示) ---
 with tab_dash:
     dash_df = df[df['專案'] == global_project].copy()
     if not dash_df.empty:
@@ -569,15 +593,26 @@ with tab_dash:
         col_chart, col_table = st.columns([1.5, 1])
         
         # 1. 圓餅圖
+        # 建立映射字典：key -> display name (使用專案獨立的設定)
+        cat_map = {c['key']: c['display'] for c in current_cat_config}
+        
+        # 統計
         chart_df = expense_df.groupby('類別')['總價'].sum().reset_index()
+        
+        # 將 Key 替換為 Display Name
+        chart_df['類別'] = chart_df['類別'].map(cat_map).fillna(chart_df['類別'])
+        
         if not chart_df.empty:
-            c = alt.Chart(chart_df).mark_arc(innerRadius=50).encode(theta=alt.Theta("總價", stack=True), color="類別", tooltip=["類別", "總價"])
+            c = alt.Chart(chart_df).mark_arc(innerRadius=50).encode(theta=alt.Theta("總價", stack=True), color=alt.Color("類別", title="類別"), tooltip=["類別", "總價"])
             with col_chart: st.altair_chart(c, use_container_width=True)
             
             # 2. 分類統計表 (呈現詳細數據)
             chart_df['佔比'] = (chart_df['總價'] / out_total * 100).map('{:.1f}%'.format)
-            chart_df['總價'] = chart_df['總價'].map('${:,.0f}'.format)
-            with col_table: st.dataframe(chart_df, use_container_width=True, hide_index=True)
+            # 格式化金額
+            chart_df['金額'] = chart_df['總價'].map('${:,.0f}'.format)
+            # 顯示表格 (隱藏原始數值欄位，只顯示格式化後的)
+            show_df = chart_df[['類別', '金額', '佔比']]
+            with col_table: st.dataframe(show_df, use_container_width=True, hide_index=True)
 
     st.divider()
     st.subheader("📄 產出財務報表")
