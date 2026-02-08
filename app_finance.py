@@ -40,13 +40,10 @@ FONT_NAME = 'Kaiu'
 
 # --- 判斷執行模式 ---
 def check_mode():
-    if not HAS_GOOGLE_LIB:
-        return "local"
+    if not HAS_GOOGLE_LIB: return "local"
     try:
-        if "gcp_service_account" in st.secrets:
-            return "cloud"
-    except:
-        pass
+        if "gcp_service_account" in st.secrets: return "cloud"
+    except: pass
     return "local"
 
 MODE = check_mode()
@@ -72,14 +69,20 @@ DEFAULT_CAT_CONFIG = [
 ]
 
 # ==========================================
-# 1. 資料存取層 (Backend) - 不含UI訊息
+# 1. 資料存取層 (Backend) - 優化快取與順暢度
 # ==========================================
 
+# 關鍵優化：使用 cache_resource 快取連線物件，避免每次操作都重新連線
+@st.cache_resource
 def get_gsheet_client():
-    scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-    creds_dict = dict(st.secrets["gcp_service_account"])
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-    return gspread.authorize(creds)
+    if not HAS_GOOGLE_LIB: return None
+    try:
+        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        creds_dict = dict(st.secrets["gcp_service_account"])
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        return gspread.authorize(creds)
+    except:
+        return None
 
 @st.cache_data(ttl=10)
 def load_data():
@@ -88,27 +91,37 @@ def load_data():
     if MODE == "cloud":
         try:
             client = get_gsheet_client()
-            sheet = client.open("FinanceData").sheet1
-            data = sheet.get_all_records()
-            df = pd.DataFrame(data) if data else pd.DataFrame(columns=cols)
-            for c in cols:
-                if c not in df.columns: df[c] = ""
-        except Exception as e:
-            return pd.DataFrame(columns=cols)
-    else:
-        if os.path.exists(DATA_FILE):
-            try:
-                df = pd.read_csv(DATA_FILE)
-            except:
-                df = pd.DataFrame(columns=cols)
-        else:
+            if client:
+                sheet = client.open("FinanceData").sheet1
+                data = sheet.get_all_records()
+                df = pd.DataFrame(data) if data else pd.DataFrame(columns=cols)
+                for c in cols:
+                    if c not in df.columns: df[c] = ""
+                # 格式化
+                text_cols = ['發票號碼', '備註', '購買地點', '經手人', '項目內容', '專案', '類別', '單位', '憑證類型']
+                for col in text_cols:
+                    if col in df.columns: df[col] = df[col].fillna("").astype(str)
+                if '日期' in df.columns:
+                    df['日期'] = pd.to_datetime(df['日期']).dt.date
+                    df['月份'] = pd.to_datetime(df['日期']).dt.strftime("%Y-%m")
+                    df['Year'] = pd.to_datetime(df['日期']).dt.year
+                return df
+        except:
+            pass # 連線失敗則回傳空表或暫存
+            
+    # Local Mode
+    if os.path.exists(DATA_FILE):
+        try:
+            df = pd.read_csv(DATA_FILE)
+        except:
             df = pd.DataFrame(columns=cols)
-            df.to_csv(DATA_FILE, index=False, encoding='utf-8-sig')
+    else:
+        df = pd.DataFrame(columns=cols)
+        df.to_csv(DATA_FILE, index=False, encoding='utf-8-sig')
 
     text_cols = ['發票號碼', '備註', '購買地點', '經手人', '項目內容', '專案', '類別', '單位', '憑證類型']
     for col in text_cols:
         if col in df.columns: df[col] = df[col].fillna("").astype(str)
-        
     if '日期' in df.columns:
         df['日期'] = pd.to_datetime(df['日期']).dt.date
         df['月份'] = pd.to_datetime(df['日期']).dt.strftime("%Y-%m")
@@ -122,15 +135,16 @@ def save_dataframe(df):
         
         if MODE == "cloud":
             client = get_gsheet_client()
-            sheet = client.open("FinanceData").sheet1
-            df_save['日期'] = df_save['日期'].astype(str)
-            sheet.clear()
-            sheet.update([df_save.columns.values.tolist()] + df_save.values.tolist())
-            load_data.clear()
+            if client:
+                sheet = client.open("FinanceData").sheet1
+                df_save['日期'] = df_save['日期'].astype(str)
+                sheet.clear()
+                sheet.update([df_save.columns.values.tolist()] + df_save.values.tolist())
+                load_data.clear()
+                return True
         else:
             df_save.to_csv(DATA_FILE, index=False, encoding='utf-8-sig')
-            
-        return True
+            return True
     except Exception as e:
         st.error(f"儲存失敗: {e}")
         return False
@@ -142,18 +156,14 @@ def load_settings():
         "locations": {"預設專案": {c["key"]: [] for c in DEFAULT_CAT_CONFIG}},
         "cat_config": DEFAULT_CAT_CONFIG
     }
-    
     if MODE == "cloud":
         try:
             client = get_gsheet_client()
-            try:
+            if client:
                 ws = client.open("FinanceData").worksheet("Settings")
                 json_str = ws.acell('A1').value
                 if json_str: return json.loads(json_str)
-            except:
-                pass
-        except:
-            pass
+        except: pass
     else:
         if os.path.exists(SETTINGS_FILE):
             with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
@@ -164,13 +174,10 @@ def save_settings(data):
     if MODE == "cloud":
         try:
             client = get_gsheet_client()
-            try:
+            if client:
                 ws = client.open("FinanceData").worksheet("Settings")
                 ws.update('A1', [[json.dumps(data, ensure_ascii=False)]])
-            except:
-                st.warning("雲端無 'Settings' 分頁。")
-        except:
-            pass
+        except: pass
     else:
         with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
@@ -179,16 +186,17 @@ def append_record(record_dict):
     if MODE == "cloud":
         try:
             client = get_gsheet_client()
-            sheet = client.open("FinanceData").sheet1
-            row = [
-                str(record_dict['日期']), record_dict['專案'], record_dict['類別'], record_dict['項目內容'],
-                record_dict['單位'], record_dict['數量'], record_dict['單價'], record_dict['總價'],
-                record_dict['購買地點'], record_dict['經手人'], record_dict['憑證類型'],
-                str(record_dict['發票號碼']), record_dict['備註']
-            ]
-            sheet.append_row(row)
-            load_data.clear() 
-            return True
+            if client:
+                sheet = client.open("FinanceData").sheet1
+                row = [
+                    str(record_dict['日期']), record_dict['專案'], record_dict['類別'], record_dict['項目內容'],
+                    record_dict['單位'], record_dict['數量'], record_dict['單價'], record_dict['總價'],
+                    record_dict['購買地點'], record_dict['經手人'], record_dict['憑證類型'],
+                    str(record_dict['發票號碼']), record_dict['備註']
+                ]
+                sheet.append_row(row)
+                load_data.clear() 
+                return True
         except Exception as e:
             st.error(f"雲端寫入錯誤: {e}")
             return False
@@ -212,7 +220,6 @@ def create_zip_backup(df, settings, target_project):
         else:
             df_out = df
             s_out = settings
-            
         csv_buffer = io.StringIO()
         df_out.to_csv(csv_buffer, index=False, encoding='utf-8-sig')
         zip_file.writestr('finance_data.csv', csv_buffer.getvalue())
@@ -330,15 +337,6 @@ settings = load_settings()
 df = load_data()
 
 st.title("🏗️ 勁翔營造 工地計帳系統")
-if MODE == "local":
-    if not HAS_GOOGLE_LIB:
-        st.warning("⚠️ 單機模式 (缺少 gspread 套件)")
-    elif "gcp_service_account" not in st.secrets:
-        st.warning("⚠️ 單機模式 (未偵測到 Secrets)")
-    else:
-        st.info("💻 單機模式 (連線失敗，使用本地 CSV)")
-else:
-    st.toast("☁️ 雲端連線模式")
 
 if 'last_check_date' not in st.session_state:
     st.session_state.last_check_date = datetime.now().date()
@@ -360,6 +358,17 @@ with st.sidebar:
     day_str, is_red = get_date_info(global_date)
     if is_red: st.markdown(f"<h3 style='color: #FF4B4B;'>{global_date} {day_str}</h3>", unsafe_allow_html=True)
     else: st.markdown(f"### {global_date} {day_str}")
+    
+    st.divider()
+    if MODE == "local":
+        if not HAS_GOOGLE_LIB:
+            st.caption("⚠️ 單機模式 (缺少 gspread 套件)")
+        elif "gcp_service_account" not in st.secrets:
+            st.caption("⚠️ 單機模式 (未偵測到金鑰)")
+        else:
+            st.caption("💻 單機模式 (連線失敗)")
+    else:
+        st.success("☁️ 雲端連線中")
 
 tab_entry, tab_data, tab_dash, tab_settings = st.tabs(["📝 支出填寫", "📋 明細管理", "📊 收支儀表板", "⚙️ 設定與管理"])
 
@@ -548,7 +557,7 @@ with tab_dash:
                 file_name = f"財務報表_{global_project}_{rpt_sel_year}_{rpt_sel_month}.pdf"
                 st.download_button("📥 點此下載 PDF", data=pdf_data, file_name=file_name, mime="application/pdf")
 
-# --- Tab 4: 設定與管理 (已修正刪除確認機制) ---
+# --- Tab 4: 設定與管理 (含完整功能) ---
 with tab_settings:
     st.header("⚙️ 設定與管理")
     st.markdown("### 一、專案管理")
