@@ -94,7 +94,6 @@ def load_data():
             for c in cols:
                 if c not in df.columns: df[c] = ""
         except Exception as e:
-            # 靜默失敗，由 UI 層處理錯誤提示
             return pd.DataFrame(columns=cols)
     else:
         if os.path.exists(DATA_FILE):
@@ -117,9 +116,6 @@ def load_data():
     return df
 
 def save_dataframe(df):
-    """
-    純粹的儲存函式，不包含 UI 提示 (Toast/Spinner)
-    """
     try:
         cols_to_drop = ['月份', 'Year', 'temp_month', '刪除', '星期/節日']
         df_save = df.drop(columns=[c for c in cols_to_drop if c in df.columns])
@@ -165,9 +161,6 @@ def load_settings():
     return default
 
 def save_settings(data):
-    """
-    純粹的設定儲存函式
-    """
     if MODE == "cloud":
         try:
             client = get_gsheet_client()
@@ -183,9 +176,6 @@ def save_settings(data):
             json.dump(data, f, ensure_ascii=False, indent=4)
 
 def append_record(record_dict):
-    """
-    單筆新增，不觸發全表重讀，減少 UI 閃爍
-    """
     if MODE == "cloud":
         try:
             client = get_gsheet_client()
@@ -197,7 +187,7 @@ def append_record(record_dict):
                 str(record_dict['發票號碼']), record_dict['備註']
             ]
             sheet.append_row(row)
-            load_data.clear() # 清除快取，確保下次讀取最新
+            load_data.clear() 
             return True
         except Exception as e:
             st.error(f"雲端寫入錯誤: {e}")
@@ -342,11 +332,11 @@ df = load_data()
 st.title("🏗️ 勁翔營造 工地計帳系統")
 if MODE == "local":
     if not HAS_GOOGLE_LIB:
-        st.warning("⚠️ 單機模式 (缺少 gspread)")
+        st.warning("⚠️ 單機模式 (缺少 gspread 套件)")
     elif "gcp_service_account" not in st.secrets:
-        st.warning("⚠️ 單機模式 (未偵測到金鑰)")
+        st.warning("⚠️ 單機模式 (未偵測到 Secrets)")
     else:
-        st.info("💻 單機模式")
+        st.info("💻 單機模式 (連線失敗，使用本地 CSV)")
 else:
     st.toast("☁️ 雲端連線模式")
 
@@ -416,7 +406,7 @@ with tab_entry:
         icon = "💰" if conf["type"] == "income" else "💸"
         k_sel = f"sel_{conf['key']}"; k_man = f"man_{conf['key']}"; k_price = f"price_{conf['key']}"
         k_buyer = f"buyer_{conf['key']}"; k_note = f"note_{conf['key']}"; k_sel_loc = f"sel_loc_{conf['key']}"
-        k_man_loc = f"man_loc_{conf_key}"; k_type = f"type_{conf['key']}"; k_inv = f"inv_{conf['key']}"
+        k_man_loc = f"man_loc_{conf['key']}"; k_type = f"type_{conf['key']}"; k_inv = f"inv_{conf['key']}"
         k_qty = f"qty_{conf['key']}"; k_unit = f"unit_{conf['key']}"
         if k_man not in st.session_state: st.session_state[k_man] = ""
         if k_price not in st.session_state: st.session_state[k_price] = 0
