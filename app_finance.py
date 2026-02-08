@@ -8,6 +8,7 @@ import streamlit.components.v1 as components
 from datetime import datetime
 import zipfile
 import io
+import copy
 
 # --- 1. 安全匯入機制 ---
 try:
@@ -153,7 +154,7 @@ def load_settings():
         "projects": ["預設專案"],
         "items": {"預設專案": {c["key"]: [] for c in DEFAULT_CAT_CONFIG}},
         "locations": {"預設專案": {c["key"]: [] for c in DEFAULT_CAT_CONFIG}},
-        "cat_config": DEFAULT_CAT_CONFIG,
+        "cat_config": DEFAULT_CAT_CONFIG, # 舊格式可能長這樣
         "item_details": {}
     }
     settings = default
@@ -170,7 +171,29 @@ def load_settings():
             with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
                 settings = json.load(f)
     
-    if "cat_config" not in settings: settings["cat_config"] = DEFAULT_CAT_CONFIG
+    # --- 關鍵修正：結構自動遷移邏輯 ---
+    # 1. 確保 projects 存在
+    if "projects" not in settings: settings["projects"] = ["預設專案"]
+    
+    # 2. 檢測 cat_config 是否為舊版 List 格式，如果是，轉為新版 Dict 格式
+    if isinstance(settings.get("cat_config"), list):
+        old_config_list = settings["cat_config"]
+        settings["cat_config"] = {} # 重置為字典
+        for p in settings["projects"]:
+            settings["cat_config"][p] = copy.deepcopy(old_config_list)
+            
+    # 3. 確保每個專案都有獨立的 cat_config
+    if isinstance(settings.get("cat_config"), dict):
+        for p in settings["projects"]:
+            if p not in settings["cat_config"]:
+                # 如果某個專案沒有設定，給它預設值
+                settings["cat_config"][p] = copy.deepcopy(DEFAULT_CAT_CONFIG)
+    else:
+        # 如果 cat_config 既不是 list 也不是 dict (異常情況)，重置
+        settings["cat_config"] = {}
+        for p in settings["projects"]:
+            settings["cat_config"][p] = copy.deepcopy(DEFAULT_CAT_CONFIG)
+
     if "item_details" not in settings: settings["item_details"] = {}
     return settings
 
@@ -218,16 +241,20 @@ def create_zip_backup(target_project=None):
     with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
         if target_project and target_project != "所有專案" and target_project != "所有專案 (完整系統)":
             df_out = df_latest[df_latest['專案'] == target_project] if not df_latest.empty else df_latest
+            
+            # 備份單一專案時，將該專案的設定轉為通用格式，方便還原
+            proj_conf = settings_latest.get("cat_config", {}).get(target_project, DEFAULT_CAT_CONFIG)
+            
             s_out = {
                 "projects": [target_project],
-                "cat_config": settings_latest.get("cat_config", DEFAULT_CAT_CONFIG),
+                "cat_config": proj_conf, # 這裡存成 List，讓還原邏輯能識別
                 "items": {target_project: settings_latest.get("items", {}).get(target_project, {})},
                 "locations": {target_project: settings_latest.get("locations", {}).get(target_project, {})},
                 "item_details": {target_project: settings_latest.get("item_details", {}).get(target_project, {})}
             }
         else:
             df_out = df_latest
-            s_out = settings_latest
+            s_out = settings_latest # 完整備份直接存 Dict 結構
         
         csv_buffer = io.StringIO()
         df_out.to_csv(csv_buffer, index=False, encoding='utf-8-sig')
@@ -351,12 +378,6 @@ if 'last_check_date' not in st.session_state:
     st.session_state.last_check_date = datetime.now().date()
 
 with st.sidebar:
-    # --- 新增：手動重新整理按鈕 ---
-    if st.button("🔄 強制重新整理資料 (若雲端有更新)", use_container_width=True):
-        load_data.clear()
-        st.rerun()
-    st.divider()
-    
     st.header("📅 專案選擇")
     if not settings["projects"]: settings["projects"] = ["預設專案"]
     current_proj_idx = 0
@@ -384,6 +405,13 @@ with st.sidebar:
             st.caption("💻 單機模式 (連線失敗)")
     else:
         st.caption("✅ 雲端連線正常")
+        
+    # --- 資料更新按鈕 (位置調整至底部) ---
+    st.write("") # Spacer
+    st.write("")
+    if st.button("🔄 資料更新", use_container_width=True, help="若雲端有更新，請點此同步"):
+        load_data.clear()
+        st.rerun()
 
 tab_entry, tab_data, tab_dash, tab_settings = st.tabs(["📝 支出填寫", "📋 明細管理", "📊 收支儀表板", "⚙️ 設定與管理"])
 
@@ -666,6 +694,8 @@ with tab_settings:
                         settings["projects"].append(new_proj)
                         settings["items"][new_proj] = {c["key"]: [] for c in settings["cat_config"]}
                         settings["locations"][new_proj] = {c["key"]: [] for c in settings["cat_config"]}
+                        # 複製預設設定給新專案
+                        settings["cat_config"][new_proj] = copy.deepcopy(DEFAULT_CAT_CONFIG)
                         save_settings(settings); st.success(f"已新增專案：{new_proj}"); time.sleep(1); st.rerun()
             st.divider()
             with st.form(key="form_ren_project"): # FORM
@@ -676,6 +706,7 @@ with tab_settings:
                         settings["projects"] = [rename_proj if p == global_project else p for p in settings["projects"]]
                         settings["items"][rename_proj] = settings["items"].pop(global_project)
                         settings["locations"][rename_proj] = settings["locations"].pop(global_project)
+                        settings["cat_config"][rename_proj] = settings["cat_config"].pop(global_project)
                         if global_project in settings.get("item_details", {}):
                             settings["item_details"][rename_proj] = settings["item_details"].pop(global_project)
                         save_settings(settings)
@@ -721,6 +752,7 @@ with tab_settings:
                         settings["projects"].remove(global_project)
                         if global_project in settings["items"]: del settings["items"][global_project]
                         if global_project in settings["locations"]: del settings["locations"][global_project]
+                        if global_project in settings["cat_config"]: del settings["cat_config"][global_project]
                         if global_project in settings.get("item_details", {}): del settings["item_details"][global_project]
                         save_settings(settings)
                         if not df.empty: df = df[df['專案'] != global_project]; save_dataframe(df)
@@ -741,6 +773,9 @@ with tab_settings:
                 iy, in_ = st.columns(2)
                 with iy:
                     if st.button("✔️ 確認匯入", key="btn_confirm_menu_imp"):
+                        # 複製大項設定
+                        settings["cat_config"][global_project] = copy.deepcopy(settings["cat_config"][source_proj])
+                        # 複製細項與地點
                         source_items = settings["items"].get(source_proj, {}); target_items = settings["items"].get(global_project, {})
                         source_locs = settings["locations"].get(source_proj, {}); target_locs = settings["locations"].get(global_project, {})
                         for cat, items in source_items.items():
@@ -767,23 +802,23 @@ with tab_settings:
                 if sub_add_cat:
                     if new_cat_name:
                         new_key = new_cat_name
-                        if any(c['key'] == new_key for c in settings["cat_config"]): st.error("名稱重複！")
+                        if any(c['key'] == new_key for c in current_cat_config): st.error("名稱重複！")
                         else:
-                            settings["cat_config"].append({"key": new_key, "display": new_cat_name, "type": new_cat_type})
+                            current_cat_config.append({"key": new_key, "display": new_cat_name, "type": new_cat_type})
                             for proj in settings["items"]:
                                 if new_key not in settings["items"][proj]: settings["items"][proj][new_key] = []
                                 if new_key not in settings["locations"][proj]: settings["locations"][proj][new_key] = []
                             save_settings(settings); st.success("已新增"); time.sleep(0.5); st.rerun()
     with st.expander("2. 記錄項目管理 (修改標題/新增/刪除)", expanded=False):
         st.info("此處修改會影響所有專案的選單顯示。")
-        for idx, cat in enumerate(settings["cat_config"]):
+        for idx, cat in enumerate(current_cat_config):
             c_label, c_input, c_btn, c_del = st.columns([2, 3, 1, 1])
             with c_label: st.text(f"原標題: {cat['display']}")
             with c_input: new_display = st.text_input(f"新名稱 {idx}", value=cat["display"], label_visibility="collapsed", key=f"cat_ren_{idx}")
             with c_btn:
                 if new_display != cat["display"]:
                     if st.button("更新", key=f"btn_upd_cat_{idx}"):
-                        settings["cat_config"][idx]["display"] = new_display; save_settings(settings); st.success("標題已更新"); time.sleep(0.5); st.rerun()
+                        current_cat_config[idx]["display"] = new_display; save_settings(settings); st.success("標題已更新"); time.sleep(0.5); st.rerun()
             with c_del:
                 del_cat_key = f"del_cat_{idx}_confirm"
                 if del_cat_key not in st.session_state: st.session_state[del_cat_key] = False
@@ -791,15 +826,15 @@ with tab_settings:
                     if st.button("刪除", key=f"btn_del_cat_{idx}"): st.session_state[del_cat_key] = True; st.rerun()
                 else:
                     if st.button("✔️", key=f"yes_cat_{idx}"):
-                        settings["cat_config"].pop(idx); save_settings(settings); st.session_state[del_cat_key] = False; st.rerun()
+                        current_cat_config.pop(idx); save_settings(settings); st.session_state[del_cat_key] = False; st.rerun()
                     if st.button("❌", key=f"no_cat_{idx}"): st.session_state[del_cat_key] = False; st.rerun()
     with st.expander("3. 細項選單管理 (修改標題/新增/刪除)", expanded=True):
-        target_cat = st.selectbox("選擇要管理的大項", [c["display"] for c in settings["cat_config"]])
-        cat_key = next(c["key"] for c in settings["cat_config"] if c["display"] == target_cat)
-        cat_type = next(c["type"] for c in settings["cat_config"] if c["display"] == target_cat)
-        if global_project not in settings["items"]: settings["items"][global_project] = {c["key"]: [] for c in settings["cat_config"]}
+        target_cat = st.selectbox("選擇要管理的大項", [c["display"] for c in current_cat_config])
+        cat_key = next(c["key"] for c in current_cat_config if c["display"] == target_cat)
+        cat_type = next(c["type"] for c in current_cat_config if c["display"] == target_cat)
+        if global_project not in settings["items"]: settings["items"][global_project] = {c["key"]: [] for c in current_cat_config}
         if cat_key not in settings["items"][global_project]: settings["items"][global_project][cat_key] = []
-        if global_project not in settings["locations"]: settings["locations"][global_project] = {c["key"]: [] for c in settings["cat_config"]}
+        if global_project not in settings["locations"]: settings["locations"][global_project] = {c["key"]: [] for c in current_cat_config}
         if cat_key not in settings["locations"][global_project]: settings["locations"][global_project][cat_key] = []
         
         if global_project not in settings.get("item_details", {}): settings.setdefault("item_details", {})[global_project] = {}
