@@ -9,7 +9,7 @@ from datetime import datetime
 import zipfile
 import io
 
-# --- 1. 安全匯入機制 (防止因缺少套件而崩潰) ---
+# --- 1. 安全匯入機制 ---
 try:
     import gspread
     from oauth2client.service_account import ServiceAccountCredentials
@@ -72,7 +72,7 @@ DEFAULT_CAT_CONFIG = [
 ]
 
 # ==========================================
-# 資料存取層
+# 1. 資料存取層 (Backend) - 不含UI訊息
 # ==========================================
 
 def get_gsheet_client():
@@ -94,7 +94,7 @@ def load_data():
             for c in cols:
                 if c not in df.columns: df[c] = ""
         except Exception as e:
-            # st.warning(f"雲端讀取異常: {e}") # 隱藏錯誤訊息，避免干擾
+            # 靜默失敗，由 UI 層處理錯誤提示
             return pd.DataFrame(columns=cols)
     else:
         if os.path.exists(DATA_FILE):
@@ -117,6 +117,9 @@ def load_data():
     return df
 
 def save_dataframe(df):
+    """
+    純粹的儲存函式，不包含 UI 提示 (Toast/Spinner)
+    """
     try:
         cols_to_drop = ['月份', 'Year', 'temp_month', '刪除', '星期/節日']
         df_save = df.drop(columns=[c for c in cols_to_drop if c in df.columns])
@@ -154,7 +157,7 @@ def load_settings():
             except:
                 pass
         except:
-            pass # 這裡之前漏了 except，已修正
+            pass
     else:
         if os.path.exists(SETTINGS_FILE):
             with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
@@ -162,6 +165,9 @@ def load_settings():
     return default
 
 def save_settings(data):
+    """
+    純粹的設定儲存函式
+    """
     if MODE == "cloud":
         try:
             client = get_gsheet_client()
@@ -171,12 +177,15 @@ def save_settings(data):
             except:
                 st.warning("雲端無 'Settings' 分頁。")
         except:
-            pass # 這裡之前漏了 except，已修正
+            pass
     else:
         with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
 
 def append_record(record_dict):
+    """
+    單筆新增，不觸發全表重讀，減少 UI 閃爍
+    """
     if MODE == "cloud":
         try:
             client = get_gsheet_client()
@@ -188,14 +197,16 @@ def append_record(record_dict):
                 str(record_dict['發票號碼']), record_dict['備註']
             ]
             sheet.append_row(row)
-            load_data.clear()
+            load_data.clear() # 清除快取，確保下次讀取最新
+            return True
         except Exception as e:
             st.error(f"雲端寫入錯誤: {e}")
+            return False
     else:
         current_df = load_data()
         new_df = pd.DataFrame([record_dict])
         updated_df = pd.concat([current_df, new_df], ignore_index=True)
-        save_dataframe(updated_df)
+        return save_dataframe(updated_df)
 
 def create_zip_backup(df, settings, target_project):
     buffer = io.BytesIO()
@@ -231,15 +242,13 @@ def get_date_info(date_obj):
     if is_weekend: return f"🔴 {w_str}", True 
     return f"{w_str}", False
 
-# --- PDF 生成 (安全版) ---
+# --- PDF 生成 ---
 def generate_pdf_report(df, project_name, year, month):
     if not HAS_PDF_LIB:
         st.error("系統缺少 'reportlab' 套件。")
         return None
-        
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=1.0*cm, leftMargin=1.0*cm, topMargin=1.5*cm, bottomMargin=1.5*cm)
-    
     font_path = FONT_FILE 
     if not os.path.exists(font_path):
         font_main = 'Helvetica'; font_bold = 'Helvetica-Bold'
@@ -333,13 +342,13 @@ df = load_data()
 st.title("🏗️ 勁翔營造 工地計帳系統")
 if MODE == "local":
     if not HAS_GOOGLE_LIB:
-        st.warning("⚠️ 單機模式 (缺少 gspread 套件，無法連線 Google Sheets)")
+        st.warning("⚠️ 單機模式 (缺少 gspread)")
     elif "gcp_service_account" not in st.secrets:
-        st.warning("⚠️ 單機模式 (未偵測到 Secrets 金鑰)")
+        st.warning("⚠️ 單機模式 (未偵測到金鑰)")
     else:
-        st.info("💻 單機模式 (連線失敗，使用本地 CSV)")
+        st.info("💻 單機模式")
 else:
-    st.toast("☁️ 雲端連線模式：資料同步儲存於 Google Sheets")
+    st.toast("☁️ 雲端連線模式")
 
 if 'last_check_date' not in st.session_state:
     st.session_state.last_check_date = datetime.now().date()
@@ -396,16 +405,18 @@ with tab_entry:
             '單位': unit, '數量': qty, '單價': price, '總價': qty*price, '購買地點': location,
             '經手人': handler, '憑證類型': r_type, '發票號碼': inv_no, '備註': note
         }
-        append_record(record)
-        st.toast(f"✅ {display_name} 儲存成功！")
-        st.session_state[k_man] = ""; st.session_state[k_price] = 0; st.session_state[k_note] = ""; st.session_state[k_buyer] = ""
-        if conf_type != "income": st.session_state[k_man_loc] = ""; st.session_state[k_inv] = ""; st.session_state[k_qty] = 1.0
+        
+        with st.spinner("正在儲存..."):
+            if append_record(record):
+                st.toast(f"✅ {display_name} 儲存成功！")
+                st.session_state[k_man] = ""; st.session_state[k_price] = 0; st.session_state[k_note] = ""; st.session_state[k_buyer] = ""
+                if conf_type != "income": st.session_state[k_man_loc] = ""; st.session_state[k_inv] = ""; st.session_state[k_qty] = 1.0
 
     for conf in settings["cat_config"]:
         icon = "💰" if conf["type"] == "income" else "💸"
         k_sel = f"sel_{conf['key']}"; k_man = f"man_{conf['key']}"; k_price = f"price_{conf['key']}"
         k_buyer = f"buyer_{conf['key']}"; k_note = f"note_{conf['key']}"; k_sel_loc = f"sel_loc_{conf['key']}"
-        k_man_loc = f"man_loc_{conf['key']}"; k_type = f"type_{conf['key']}"; k_inv = f"inv_{conf['key']}"
+        k_man_loc = f"man_loc_{conf_key}"; k_type = f"type_{conf['key']}"; k_inv = f"inv_{conf['key']}"
         k_qty = f"qty_{conf['key']}"; k_unit = f"unit_{conf['key']}"
         if k_man not in st.session_state: st.session_state[k_man] = ""
         if k_price not in st.session_state: st.session_state[k_price] = 0
@@ -547,7 +558,7 @@ with tab_dash:
                 file_name = f"財務報表_{global_project}_{rpt_sel_year}_{rpt_sel_month}.pdf"
                 st.download_button("📥 點此下載 PDF", data=pdf_data, file_name=file_name, mime="application/pdf")
 
-# --- Tab 4: 設定與管理 (全功能) ---
+# --- Tab 4: 設定與管理 (已修正刪除確認機制) ---
 with tab_settings:
     st.header("⚙️ 設定與管理")
     st.markdown("### 一、專案管理")
@@ -571,6 +582,7 @@ with tab_settings:
     with st.expander("2. 專案管理 (新增/匯入/改名/刪除)", expanded=True):
         c1, c2 = st.columns(2)
         with c1:
+            st.subheader("新增與改名")
             new_proj = st.text_input("新增專案名稱")
             if st.button("➕ 新增"):
                 if new_proj and new_proj not in settings["projects"]:
@@ -605,14 +617,26 @@ with tab_settings:
                             if l not in t_l[c]: t_l[c].append(l)
                     save_settings(settings); st.success("匯入完成"); st.rerun()
             st.divider()
-            if st.button("🗑️ 刪除此專案"):
-                if len(settings["projects"]) <= 1: st.error("無法刪除最後一個專案")
-                else:
+            
+            # --- 專案刪除 (確認機制) ---
+            if "confirm_del_proj" not in st.session_state: st.session_state.confirm_del_proj = False
+            
+            if not st.session_state.confirm_del_proj:
+                if st.button("🗑️ 刪除此專案"):
+                    if len(settings["projects"]) <= 1: st.error("無法刪除最後一個專案")
+                    else: st.session_state.confirm_del_proj = True; st.rerun()
+            else:
+                st.warning(f"⚠️ 確定要刪除「{global_project}」？此動作無法復原！")
+                col_yes, col_no = st.columns(2)
+                if col_yes.button("✔️ 是，刪除"):
                     settings["projects"].remove(global_project)
                     del settings["items"][global_project]; del settings["locations"][global_project]
                     save_settings(settings)
                     if not df.empty: save_dataframe(df[df['專案'] != global_project])
-                    st.success("專案已刪除"); st.rerun()
+                    st.session_state.confirm_del_proj = False
+                    st.success("專案已刪除"); time.sleep(1); st.rerun()
+                if col_no.button("❌ 取消"):
+                    st.session_state.confirm_del_proj = False; st.rerun()
 
     st.markdown("### 二、分類管理")
     with st.expander("1. 大項管理 (類別)", expanded=False):
@@ -627,6 +651,8 @@ with tab_settings:
                     for p in settings["items"]:
                         settings["items"][p][new_cat] = []; settings["locations"][p][new_cat] = []
                     save_settings(settings); st.rerun()
+        
+        st.divider()
         for i, c in enumerate(settings["cat_config"]):
             c1, c2, c3 = st.columns([3, 1, 1])
             with c1: new_disp = st.text_input(f"名稱 {i}", c['display'], key=f"rn_{i}", label_visibility="collapsed")
@@ -634,15 +660,24 @@ with tab_settings:
                 if st.button("更", key=f"up_{i}"): 
                     settings["cat_config"][i]["display"] = new_disp; save_settings(settings); st.rerun()
             with c3:
-                if st.button("刪", key=f"dl_{i}"):
-                    settings["cat_config"].pop(i); save_settings(settings); st.rerun()
+                # --- 大項刪除 (確認機制) ---
+                del_key = f"del_cat_confirm_{i}"
+                if del_key not in st.session_state: st.session_state[del_key] = False
+                
+                if not st.session_state[del_key]:
+                    if st.button("刪", key=f"dl_{i}"): st.session_state[del_key] = True; st.rerun()
+                else:
+                    st.markdown("**確認刪除?**")
+                    if st.button("✔️", key=f"yes_cat_{i}"):
+                        settings["cat_config"].pop(i); save_settings(settings); st.session_state[del_key] = False; st.rerun()
+                    if st.button("❌", key=f"no_cat_{i}"):
+                        st.session_state[del_key] = False; st.rerun()
 
     with st.expander("2. 細項管理 (項目/地點)", expanded=True):
         t_cat = st.selectbox("選擇大項", [c["display"] for c in settings["cat_config"]])
         c_key = next(c["key"] for c in settings["cat_config"] if c["display"] == t_cat)
         c_type = next(c["type"] for c in settings["cat_config"] if c["display"] == t_cat)
         
-        # 確保結構
         if global_project not in settings["items"]: settings["items"][global_project] = {c["key"]: [] for c in settings["cat_config"]}
         if c_key not in settings["items"][global_project]: settings["items"][global_project][c_key] = []
         if global_project not in settings["locations"]: settings["locations"][global_project] = {c["key"]: [] for c in settings["cat_config"]}
@@ -661,7 +696,7 @@ with tab_settings:
                 if new_it and new_it not in curr_list:
                     if list_type == "item": settings["items"][global_project][c_key].append(new_it)
                     else: settings["locations"][global_project][c_key].append(new_it)
-                    save_settings(settings); st.rerun()
+                    save_settings(settings); st.success("已加入"); st.rerun()
         
         for i, it in enumerate(curr_list):
             ic1, ic2, ic3, ic4 = st.columns([2, 3, 1, 1])
@@ -681,7 +716,16 @@ with tab_settings:
                             df.loc[mask, '購買地點'] = rn; save_dataframe(df)
                     save_settings(settings); st.success("已更新"); time.sleep(0.5); st.rerun()
             with ic4:
-                if st.button("🗑️", key=f"rm_{i}"):
-                    if list_type == "item": settings["items"][global_project][c_key].remove(it)
-                    else: settings["locations"][global_project][c_key].remove(it)
-                    save_settings(settings); st.rerun()
+                # --- 細項刪除 (確認機制) ---
+                del_sub_key = f"del_item_confirm_{i}_{list_type}"
+                if del_sub_key not in st.session_state: st.session_state[del_sub_key] = False
+                
+                if not st.session_state[del_sub_key]:
+                    if st.button("🗑️", key=f"rm_{i}"): st.session_state[del_sub_key] = True; st.rerun()
+                else:
+                    if st.button("✔️", key=f"yes_sub_{i}"):
+                        if list_type == "item": settings["items"][global_project][c_key].remove(it)
+                        else: settings["locations"][global_project][c_key].remove(it)
+                        save_settings(settings); st.session_state[del_sub_key] = False; st.rerun()
+                    if st.button("❌", key=f"no_sub_{i}"):
+                        st.session_state[del_sub_key] = False; st.rerun()
