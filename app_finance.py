@@ -69,10 +69,10 @@ DEFAULT_CAT_CONFIG = [
 ]
 
 # ==========================================
-# 1. 資料存取層 (Backend) - 優化快取與順暢度
+# 1. 資料存取層 (Backend) - 極致順暢化
 # ==========================================
 
-# 關鍵優化：使用 cache_resource 快取連線物件，避免每次操作都重新連線
+# 使用 cache_resource 鎖定連線物件，解決輸入卡頓與重複連線訊息問題
 @st.cache_resource
 def get_gsheet_client():
     if not HAS_GOOGLE_LIB: return None
@@ -107,7 +107,7 @@ def load_data():
                     df['Year'] = pd.to_datetime(df['日期']).dt.year
                 return df
         except:
-            pass # 連線失敗則回傳空表或暫存
+            pass 
             
     # Local Mode
     if os.path.exists(DATA_FILE):
@@ -154,21 +154,27 @@ def load_settings():
         "projects": ["預設專案"],
         "items": {"預設專案": {c["key"]: [] for c in DEFAULT_CAT_CONFIG}},
         "locations": {"預設專案": {c["key"]: [] for c in DEFAULT_CAT_CONFIG}},
-        "cat_config": DEFAULT_CAT_CONFIG
+        "cat_config": DEFAULT_CAT_CONFIG,
+        "item_details": {} # 新增：用來儲存單價與單位的結構
     }
+    
+    settings = default
     if MODE == "cloud":
         try:
             client = get_gsheet_client()
             if client:
                 ws = client.open("FinanceData").worksheet("Settings")
                 json_str = ws.acell('A1').value
-                if json_str: return json.loads(json_str)
+                if json_str: settings = json.loads(json_str)
         except: pass
     else:
         if os.path.exists(SETTINGS_FILE):
             with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-    return default
+                settings = json.load(f)
+    
+    # 確保資料結構完整
+    if "item_details" not in settings: settings["item_details"] = {}
+    return settings
 
 def save_settings(data):
     if MODE == "cloud":
@@ -211,11 +217,13 @@ def create_zip_backup(df, settings, target_project):
     with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
         if target_project and target_project != "所有專案 (完整系統)":
             df_out = df[df['專案'] == target_project] if not df.empty else df
+            # 過濾設定
             s_out = {
                 "projects": [target_project],
                 "cat_config": settings.get("cat_config", DEFAULT_CAT_CONFIG),
                 "items": {target_project: settings.get("items", {}).get(target_project, {})},
-                "locations": {target_project: settings.get("locations", {}).get(target_project, {})}
+                "locations": {target_project: settings.get("locations", {}).get(target_project, {})},
+                "item_details": {target_project: settings.get("item_details", {}).get(target_project, {})}
             }
         else:
             df_out = df
@@ -368,13 +376,17 @@ with st.sidebar:
         else:
             st.caption("💻 單機模式 (連線失敗)")
     else:
-        st.success("☁️ 雲端連線中")
+        st.caption("✅ 雲端連線正常")
 
 tab_entry, tab_data, tab_dash, tab_settings = st.tabs(["📝 支出填寫", "📋 明細管理", "📊 收支儀表板", "⚙️ 設定與管理"])
 
 # --- Tab 1: 支出填寫 ---
 with tab_entry:
     st.info(f"📍 當前專案：{global_project} | 日期：{global_date} {day_str}")
+    
+    # 預先讀取該專案的細項預設值
+    item_details = settings.get("item_details", {}).get(global_project, {})
+
     def handle_save_tab1(conf_key, conf_type, display_name):
         k_sel = f"sel_{conf_key}"; k_man = f"man_{conf_key}"; k_sel_loc = f"sel_loc_{conf_key}"
         k_man_loc = f"man_loc_{conf_key}"; k_loc = f"loc_{conf_key}"; k_buyer = f"buyer_{conf_key}"
@@ -408,6 +420,7 @@ with tab_entry:
         with st.spinner("正在儲存..."):
             if append_record(record):
                 st.toast(f"✅ {display_name} 儲存成功！")
+                # 清空欄位
                 st.session_state[k_man] = ""; st.session_state[k_price] = 0; st.session_state[k_note] = ""; st.session_state[k_buyer] = ""
                 if conf_type != "income": st.session_state[k_man_loc] = ""; st.session_state[k_inv] = ""; st.session_state[k_qty] = 1.0
 
@@ -417,6 +430,8 @@ with tab_entry:
         k_buyer = f"buyer_{conf['key']}"; k_note = f"note_{conf['key']}"; k_sel_loc = f"sel_loc_{conf['key']}"
         k_man_loc = f"man_loc_{conf['key']}"; k_type = f"type_{conf['key']}"; k_inv = f"inv_{conf['key']}"
         k_qty = f"qty_{conf['key']}"; k_unit = f"unit_{conf['key']}"
+        
+        # 初始化預設值
         if k_man not in st.session_state: st.session_state[k_man] = ""
         if k_price not in st.session_state: st.session_state[k_price] = 0
         if k_qty not in st.session_state: st.session_state[k_qty] = 1.0
@@ -426,6 +441,14 @@ with tab_entry:
             items_list = settings["items"].get(global_project, {}).get(conf["key"], [])
             items_with_manual = items_list + ["✏️ 手動輸入..."]
             
+            # --- Auto-fill Logic ---
+            # 為了讓 Tab 4 設定的預設價格能自動帶入
+            def update_defaults(key_sel, key_price, key_unit):
+                sel_item = st.session_state.get(key_sel)
+                if sel_item and sel_item in item_details:
+                    st.session_state[key_price] = item_details[sel_item].get("price", 0)
+                    st.session_state[key_unit] = item_details[sel_item].get("unit", "式")
+
             if conf["type"] == "income":
                 with col1:
                     sel = st.selectbox("入帳來源", items_with_manual, key=k_sel)
@@ -434,7 +457,7 @@ with tab_entry:
                 with col2: st.text_input("收帳人 (經手人)", key=k_buyer); st.text_area("備註", key=k_note)
             else:
                 with col1:
-                    sel = st.selectbox("項目內容", items_with_manual, key=k_sel)
+                    sel = st.selectbox("項目內容", items_with_manual, key=k_sel, on_change=update_defaults, args=(k_sel, k_price, k_unit))
                     if sel == "✏️ 手動輸入...": st.text_input("請輸入項目名稱", key=k_man)
                     locs_list = settings["locations"].get(global_project, {}).get(conf["key"], [])
                     locs_with_manual = locs_list + ["✏️ 手動輸入..."]
@@ -525,7 +548,7 @@ with tab_data:
                                 if save_dataframe(pd.concat([df_kept, df_add], ignore_index=True)): st.success("已刪除"); time.sleep(1); st.rerun()
                     st.markdown("---")
 
-# --- Tab 3: 收支儀表板 ---
+# --- Tab 3: 收支儀表板 (已新增分類統計表) ---
 with tab_dash:
     dash_df = df[df['專案'] == global_project].copy()
     if not dash_df.empty:
@@ -533,13 +556,26 @@ with tab_dash:
         today_str = datetime.now().date(); cur_year = today_str.year
         income_df = dash_df[dash_df['類別'] == '入帳金額']; expense_df = dash_df[dash_df['類別'] != '入帳金額']
         in_total = income_df['總價'].sum(); out_total = expense_df['總價'].sum()
+        
         st.markdown(f"### 📊 {cur_year}年 財務概況")
         i1, i2 = st.columns(2); i1.metric("專案總入帳", f"${in_total:,.0f}"); i2.metric("專案總支出", f"${out_total:,.0f}")
-        st.divider(); st.metric("💰 專案目前結餘", f"${in_total - out_total:,.0f}"); st.divider()
+        st.divider(); st.metric("💰 專案目前結餘", f"${in_total - out_total:,.0f}")
+        
+        st.divider()
+        st.subheader("支出結構分析")
+        col_chart, col_table = st.columns([1.5, 1])
+        
+        # 1. 圓餅圖
         chart_df = expense_df.groupby('類別')['總價'].sum().reset_index()
         if not chart_df.empty:
             c = alt.Chart(chart_df).mark_arc(innerRadius=50).encode(theta=alt.Theta("總價", stack=True), color="類別", tooltip=["類別", "總價"])
-            st.altair_chart(c, use_container_width=True)
+            with col_chart: st.altair_chart(c, use_container_width=True)
+            
+            # 2. 分類統計表 (新增功能)
+            chart_df['佔比'] = (chart_df['總價'] / out_total * 100).map('{:.1f}%'.format)
+            chart_df['總價'] = chart_df['總價'].map('${:,.0f}'.format)
+            with col_table: st.dataframe(chart_df, use_container_width=True, hide_index=True)
+
     st.divider()
     st.subheader("📄 產出財務報表")
     if not dash_df.empty:
@@ -557,7 +593,7 @@ with tab_dash:
                 file_name = f"財務報表_{global_project}_{rpt_sel_year}_{rpt_sel_month}.pdf"
                 st.download_button("📥 點此下載 PDF", data=pdf_data, file_name=file_name, mime="application/pdf")
 
-# --- Tab 4: 設定與管理 (含完整功能) ---
+# --- Tab 4: 設定與管理 (已新增單價/單位管理與刪除確認) ---
 with tab_settings:
     st.header("⚙️ 設定與管理")
     st.markdown("### 一、專案管理")
@@ -596,6 +632,10 @@ with tab_settings:
                     settings["projects"] = [rename_proj if p == global_project else p for p in settings["projects"]]
                     settings["items"][rename_proj] = settings["items"].pop(global_project)
                     settings["locations"][rename_proj] = settings["locations"].pop(global_project)
+                    # 遷移 item_details
+                    if global_project in settings.get("item_details", {}):
+                        settings["item_details"][rename_proj] = settings["item_details"].pop(global_project)
+                    
                     save_settings(settings)
                     if not df.empty:
                         df.loc[df['專案'] == global_project, '專案'] = rename_proj
@@ -617,19 +657,18 @@ with tab_settings:
                     save_settings(settings); st.success("匯入完成"); st.rerun()
             st.divider()
             
-            # --- 專案刪除 (確認機制) ---
             if "confirm_del_proj" not in st.session_state: st.session_state.confirm_del_proj = False
-            
             if not st.session_state.confirm_del_proj:
                 if st.button("🗑️ 刪除此專案"):
                     if len(settings["projects"]) <= 1: st.error("無法刪除最後一個專案")
                     else: st.session_state.confirm_del_proj = True; st.rerun()
             else:
-                st.warning(f"⚠️ 確定要刪除「{global_project}」？此動作無法復原！")
+                st.warning(f"⚠️ 確定要刪除「{global_project}」？")
                 col_yes, col_no = st.columns(2)
                 if col_yes.button("✔️ 是，刪除"):
                     settings["projects"].remove(global_project)
                     del settings["items"][global_project]; del settings["locations"][global_project]
+                    if global_project in settings.get("item_details", {}): del settings["item_details"][global_project]
                     save_settings(settings)
                     if not df.empty: save_dataframe(df[df['專案'] != global_project])
                     st.session_state.confirm_del_proj = False
@@ -650,8 +689,6 @@ with tab_settings:
                     for p in settings["items"]:
                         settings["items"][p][new_cat] = []; settings["locations"][p][new_cat] = []
                     save_settings(settings); st.rerun()
-        
-        st.divider()
         for i, c in enumerate(settings["cat_config"]):
             c1, c2, c3 = st.columns([3, 1, 1])
             with c1: new_disp = st.text_input(f"名稱 {i}", c['display'], key=f"rn_{i}", label_visibility="collapsed")
@@ -659,14 +696,12 @@ with tab_settings:
                 if st.button("更", key=f"up_{i}"): 
                     settings["cat_config"][i]["display"] = new_disp; save_settings(settings); st.rerun()
             with c3:
-                # --- 大項刪除 (確認機制) ---
                 del_key = f"del_cat_confirm_{i}"
                 if del_key not in st.session_state: st.session_state[del_key] = False
-                
                 if not st.session_state[del_key]:
                     if st.button("刪", key=f"dl_{i}"): st.session_state[del_key] = True; st.rerun()
                 else:
-                    st.markdown("**確認刪除?**")
+                    st.markdown("**確認?**")
                     if st.button("✔️", key=f"yes_cat_{i}"):
                         settings["cat_config"].pop(i); save_settings(settings); st.session_state[del_key] = False; st.rerun()
                     if st.button("❌", key=f"no_cat_{i}"):
@@ -677,9 +712,11 @@ with tab_settings:
         c_key = next(c["key"] for c in settings["cat_config"] if c["display"] == t_cat)
         c_type = next(c["type"] for c in settings["cat_config"] if c["display"] == t_cat)
         
+        # 確保結構
         if global_project not in settings["items"]: settings["items"][global_project] = {c["key"]: [] for c in settings["cat_config"]}
         if c_key not in settings["items"][global_project]: settings["items"][global_project][c_key] = []
         if global_project not in settings["locations"]: settings["locations"][global_project] = {c["key"]: [] for c in settings["cat_config"]}
+        if global_project not in settings.get("item_details", {}): settings.setdefault("item_details", {})[global_project] = {}
 
         list_type = "item"
         if c_type != "income":
@@ -695,36 +732,82 @@ with tab_settings:
                 if new_it and new_it not in curr_list:
                     if list_type == "item": settings["items"][global_project][c_key].append(new_it)
                     else: settings["locations"][global_project][c_key].append(new_it)
+                    # 初始化單價/單位
+                    if list_type == "item":
+                        settings["item_details"][global_project][new_it] = {"price": 0, "unit": "式"}
                     save_settings(settings); st.success("已加入"); st.rerun()
         
-        for i, it in enumerate(curr_list):
-            ic1, ic2, ic3, ic4 = st.columns([2, 3, 1, 1])
-            with ic1: st.text(it)
-            with ic2: rn = st.text_input("改名", it, key=f"rni_{i}", label_visibility="collapsed")
-            with ic3:
-                if st.button("💾", key=f"sv_{i}"):
-                    if list_type == "item":
-                        settings["items"][global_project][c_key][i] = rn
-                        if not df.empty:
-                            mask = (df['專案'] == global_project) & (df['類別'] == c_key) & (df['項目內容'] == it)
-                            df.loc[mask, '項目內容'] = rn; save_dataframe(df)
-                    else:
-                        settings["locations"][global_project][c_key][i] = rn
-                        if not df.empty:
-                            mask = (df['專案'] == global_project) & (df['類別'] == c_key) & (df['購買地點'] == it)
-                            df.loc[mask, '購買地點'] = rn; save_dataframe(df)
-                    save_settings(settings); st.success("已更新"); time.sleep(0.5); st.rerun()
-            with ic4:
-                # --- 細項刪除 (確認機制) ---
-                del_sub_key = f"del_item_confirm_{i}_{list_type}"
-                if del_sub_key not in st.session_state: st.session_state[del_sub_key] = False
+        # --- 介面優化：完整欄位編輯 (仿單機版) ---
+        if curr_list:
+            if list_type == "item":
+                # Item 模式：顯示 名稱 | 預設單價 | 預設單位 | 儲存 | 刪除
+                h1, h2, h3, h4, h5 = st.columns([2, 1.5, 1, 0.5, 0.5])
+                h1.markdown("**項目名稱**")
+                h2.markdown("**預設單價**")
+                h3.markdown("**單位**")
                 
-                if not st.session_state[del_sub_key]:
-                    if st.button("🗑️", key=f"rm_{i}"): st.session_state[del_sub_key] = True; st.rerun()
-                else:
-                    if st.button("✔️", key=f"yes_sub_{i}"):
-                        if list_type == "item": settings["items"][global_project][c_key].remove(it)
-                        else: settings["locations"][global_project][c_key].remove(it)
-                        save_settings(settings); st.session_state[del_sub_key] = False; st.rerun()
-                    if st.button("❌", key=f"no_sub_{i}"):
-                        st.session_state[del_sub_key] = False; st.rerun()
+                for i, it in enumerate(curr_list):
+                    ic1, ic2, ic3, ic4, ic5 = st.columns([2, 1.5, 1, 0.5, 0.5])
+                    
+                    # 取得目前設定值
+                    curr_detail = settings["item_details"][global_project].get(it, {"price": 0, "unit": "式"})
+                    
+                    with ic1: rn = st.text_input("N", it, key=f"rn_{i}", label_visibility="collapsed")
+                    with ic2: rp = st.number_input("P", value=int(curr_detail["price"]), step=100, key=f"rp_{i}", label_visibility="collapsed")
+                    with ic3: ru = st.text_input("U", value=curr_detail["unit"], key=f"ru_{i}", label_visibility="collapsed")
+                    
+                    # 儲存邏輯
+                    with ic4:
+                        if st.button("💾", key=f"sv_{i}"):
+                            # 1. 更新名稱
+                            if rn != it:
+                                settings["items"][global_project][c_key][i] = rn
+                                # 同步更新歷史資料
+                                if not df.empty:
+                                    mask = (df['專案'] == global_project) & (df['類別'] == c_key) & (df['項目內容'] == it)
+                                    df.loc[mask, '項目內容'] = rn; save_dataframe(df)
+                                # 刪除舊 key, 建立新 key
+                                if it in settings["item_details"][global_project]:
+                                    del settings["item_details"][global_project][it]
+                            
+                            # 2. 更新價格與單位
+                            settings["item_details"][global_project][rn] = {"price": rp, "unit": ru}
+                            save_settings(settings); st.success("已更新"); time.sleep(0.5); st.rerun()
+                    
+                    # 刪除邏輯
+                    with ic5:
+                        del_sub_key = f"del_item_confirm_{i}_{list_type}"
+                        if del_sub_key not in st.session_state: st.session_state[del_sub_key] = False
+                        
+                        if not st.session_state[del_sub_key]:
+                            if st.button("🗑️", key=f"rm_{i}"): st.session_state[del_sub_key] = True; st.rerun()
+                        else:
+                            if st.button("✔️", key=f"yes_{i}"):
+                                settings["items"][global_project][c_key].remove(it)
+                                if it in settings["item_details"][global_project]:
+                                    del settings["item_details"][global_project][it]
+                                save_settings(settings); st.session_state[del_sub_key] = False; st.rerun()
+            else:
+                # Location 模式：顯示 名稱 | 儲存 | 刪除 (地點不需要單價)
+                for i, it in enumerate(curr_list):
+                    ic1, ic2, ic3 = st.columns([3, 1, 1])
+                    with ic1: rn = st.text_input("地點", it, key=f"rn_l_{i}", label_visibility="collapsed")
+                    with ic2:
+                        if rn != it:
+                            if st.button("💾", key=f"sv_l_{i}"):
+                                settings["locations"][global_project][c_key][i] = rn
+                                if not df.empty:
+                                    mask = (df['專案'] == global_project) & (df['類別'] == c_key) & (df['購買地點'] == it)
+                                    df.loc[mask, '購買地點'] = rn; save_dataframe(df)
+                                save_settings(settings); st.success("已更新"); time.sleep(0.5); st.rerun()
+                    with ic3:
+                        del_sub_key = f"del_loc_confirm_{i}"
+                        if del_sub_key not in st.session_state: st.session_state[del_sub_key] = False
+                        if not st.session_state[del_sub_key]:
+                            if st.button("🗑️", key=f"rm_l_{i}"): st.session_state[del_sub_key] = True; st.rerun()
+                        else:
+                            if st.button("✔️", key=f"yes_l_{i}"):
+                                settings["locations"][global_project][c_key].remove(it)
+                                save_settings(settings); st.session_state[del_sub_key] = False; st.rerun()
+        else:
+            st.info("尚無項目")
