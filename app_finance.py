@@ -1,7 +1,5 @@
 import streamlit as st
 import pandas as pd
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
 import os
 import json
 import time
@@ -10,6 +8,14 @@ import streamlit.components.v1 as components
 from datetime import datetime
 import zipfile
 import io
+
+# --- 嘗試匯入雲端套件 (本地沒有也不會報錯) ---
+try:
+    import gspread
+    from oauth2client.service_account import ServiceAccountCredentials
+    HAS_GOOGLE_LIB = True
+except ImportError:
+    HAS_GOOGLE_LIB = False
 
 # --- PDF 報表相關套件 ---
 from reportlab.lib.pagesizes import A4
@@ -20,12 +26,22 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.lib.units import cm
 
-# 設定頁面
-st.set_page_config(page_title="勁翔營造 工地計帳系統 (線上版)", layout="wide", page_icon="🏗️")
+st.set_page_config(page_title="勁翔營造 工地計帳系統", layout="wide", page_icon="🏗️")
 
-# --- 常數與設定 ---
+# --- 檔案與字型設定 ---
+DATA_FILE = 'finance_data.csv'
+SETTINGS_FILE = 'finance_settings.json'
 FONT_FILE = 'kaiu.ttf' 
 FONT_NAME = 'Kaiu'
+
+# --- 判斷執行模式 (關鍵邏輯) ---
+# 如果有安裝 gspread 且 讀得到 secrets，就用雲端模式；否則用本地 CSV 模式
+def check_mode():
+    if HAS_GOOGLE_LIB and "gcp_service_account" in st.secrets:
+        return "cloud"
+    return "local"
+
+MODE = check_mode()
 
 # --- 台灣例假日 ---
 HOLIDAYS = {
@@ -37,7 +53,6 @@ HOLIDAYS = {
     "2026-06-19": "端午節", "2026-09-25": "中秋節", "2026-10-10": "國慶日"
 }
 
-# --- 預設類別設定 ---
 DEFAULT_CAT_CONFIG = [
     {"key": "入帳金額", "display": "01. 入帳金額 (零用金)", "type": "income"},
     {"key": "施工耗材", "display": "02. 施工耗材", "type": "expense"},
@@ -49,167 +64,156 @@ DEFAULT_CAT_CONFIG = [
 ]
 
 # ==========================================
-# 1. Google Sheets 連線與資料存取 (Cloud I/O)
+# 1. 資料存取層 (Data Access Layer)
 # ==========================================
 
-def get_google_sheet_client():
-    # 連線到 Google Sheets
+def get_gsheet_client():
     scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-    # 從 Streamlit Secrets 讀取金鑰
     creds_dict = dict(st.secrets["gcp_service_account"])
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-    client = gspread.authorize(creds)
-    return client
+    return gspread.authorize(creds)
 
-@st.cache_data(ttl=5) # 短暫快取避免頻繁讀取
+@st.cache_data(ttl=10)
 def load_data():
-    try:
-        client = get_google_sheet_client()
-        # 假設資料存在名為 'FinanceData' 的試算表的第一個分頁
-        sheet = client.open("FinanceData").sheet1
-        data = sheet.get_all_records()
-        
-        cols = ['日期', '專案', '類別', '項目內容', '單位', '數量', '單價', '總價',
-                '購買地點', '經手人', '憑證類型', '發票號碼', '備註']
-        
-        if not data:
+    cols = ['日期', '專案', '類別', '項目內容', '單位', '數量', '單價', '總價', '購買地點', '經手人', '憑證類型', '發票號碼', '備註', '月份', 'Year']
+    
+    if MODE == "cloud":
+        try:
+            client = get_gsheet_client()
+            sheet = client.open("FinanceData").sheet1
+            data = sheet.get_all_records()
+            df = pd.DataFrame(data) if data else pd.DataFrame(columns=cols)
+            # 補齊欄位
+            for c in cols:
+                if c not in df.columns: df[c] = ""
+        except Exception as e:
+            st.error(f"雲端連線失敗，切換至暫存模式: {e}")
             return pd.DataFrame(columns=cols)
+    else:
+        # 本地模式
+        if os.path.exists(DATA_FILE):
+            df = pd.read_csv(DATA_FILE)
+        else:
+            df = pd.DataFrame(columns=cols)
+            df.to_csv(DATA_FILE, index=False, encoding='utf-8-sig')
 
-        df = pd.DataFrame(data)
+    # 共同格式處理
+    text_cols = ['發票號碼', '備註', '購買地點', '經手人', '項目內容', '專案', '類別', '單位', '憑證類型']
+    for col in text_cols:
+        if col in df.columns: df[col] = df[col].fillna("").astype(str)
         
-        # 補齊缺失欄位
-        for c in cols:
-            if c not in df.columns: df[c] = ""
-
-        # 強制轉字串避免錯誤
-        text_cols = ['發票號碼', '備註', '購買地點', '經手人', '項目內容', '專案', '類別', '單位', '憑證類型']
-        for col in text_cols:
-            if col in df.columns: df[col] = df[col].fillna("").astype(str)
-            
-        if '日期' in df.columns:
-            df['日期'] = pd.to_datetime(df['日期']).dt.date
-            df['月份'] = pd.to_datetime(df['日期']).dt.strftime("%Y-%m")
-            df['Year'] = pd.to_datetime(df['日期']).dt.year
-            
-        return df
-    except Exception as e:
-        st.error(f"雲端資料讀取失敗 (請檢查 Secrets 或 Google Sheet 名稱): {e}")
-        return pd.DataFrame()
+    if '日期' in df.columns:
+        df['日期'] = pd.to_datetime(df['日期']).dt.date
+        df['月份'] = pd.to_datetime(df['日期']).dt.strftime("%Y-%m")
+        df['Year'] = pd.to_datetime(df['日期']).dt.year
+    return df
 
 def save_dataframe(df):
     try:
-        client = get_google_sheet_client()
-        sheet = client.open("FinanceData").sheet1
-        
-        # 移除輔助欄位再上傳
+        # 移除輔助欄位
         cols_to_drop = ['月份', 'Year', 'temp_month', '刪除', '星期/節日']
         df_save = df.drop(columns=[c for c in cols_to_drop if c in df.columns])
-        df_save['日期'] = df_save['日期'].astype(str) # 日期轉字串
         
-        sheet.clear() # 清空舊資料
-        sheet.update([df_save.columns.values.tolist()] + df_save.values.tolist()) # 寫入新資料
-        
-        load_data.clear() # 清除快取
+        if MODE == "cloud":
+            client = get_gsheet_client()
+            sheet = client.open("FinanceData").sheet1
+            df_save['日期'] = df_save['日期'].astype(str)
+            sheet.clear()
+            sheet.update([df_save.columns.values.tolist()] + df_save.values.tolist())
+            load_data.clear()
+        else:
+            df_save.to_csv(DATA_FILE, index=False, encoding='utf-8-sig')
+            
         return True
     except Exception as e:
-        st.error(f"雲端儲存失敗: {e}")
+        st.error(f"儲存失敗: {e}")
         return False
 
-def append_finance_record(date, project, category, item, unit, qty, price, location, handler, r_type, inv_no, note):
-    total = qty * price
-    inv_no_str = str(inv_no) if inv_no else ""
-    row_data = [str(date), project, category, item, unit, qty, price, total, location, handler, r_type, inv_no_str, note]
-    
-    try:
-        client = get_google_sheet_client()
-        sheet = client.open("FinanceData").sheet1
-        sheet.append_row(row_data)
-        load_data.clear() # 清除快取
-    except Exception as e:
-        st.error(f"新增失敗: {e}")
-
-# --- 設定檔存取 (儲存在 Google Sheets 的 'Settings' 分頁) ---
 def load_settings():
-    default_settings = {
+    default = {
         "projects": ["預設專案"],
         "items": {"預設專案": {c["key"]: [] for c in DEFAULT_CAT_CONFIG}},
         "locations": {"預設專案": {c["key"]: [] for c in DEFAULT_CAT_CONFIG}},
         "cat_config": DEFAULT_CAT_CONFIG
     }
     
-    try:
-        client = get_google_sheet_client()
-        # 嘗試讀取名為 'Settings' 的分頁
+    if MODE == "cloud":
         try:
-            ws = client.open("FinanceData").worksheet("Settings")
-            json_str = ws.acell('A1').value
-            if json_str:
-                data = json.loads(json_str)
-                # 補齊結構防止舊設定檔缺欄位
-                if "cat_config" not in data: data["cat_config"] = DEFAULT_CAT_CONFIG
-                if "locations" not in data: data["locations"] = {}
-                for p in data["projects"]:
-                    if p not in data["items"]: data["items"][p] = {c["key"]: [] for c in data["cat_config"]}
-                    if p not in data["locations"]: data["locations"][p] = {c["key"]: [] for c in data["cat_config"]}
-                    for c in data["cat_config"]:
-                        if c["key"] not in data["items"][p]: data["items"][p][c["key"]] = []
-                        if c["key"] not in data["locations"][p]: data["locations"][p][c["key"]] = []
-                return data
-        except:
-            pass # 若無分頁或讀取失敗，回傳預設值
-            
-        return default_settings
-    except Exception as e:
-        return default_settings
+            client = get_gsheet_client()
+            try:
+                ws = client.open("FinanceData").worksheet("Settings")
+                json_str = ws.acell('A1').value
+                if json_str: return json.loads(json_str)
+            except:
+                pass
+    else:
+        if os.path.exists(SETTINGS_FILE):
+            with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+                
+    return default
 
-def save_settings(settings_data):
-    try:
-        client = get_google_sheet_client()
+def save_settings(data):
+    if MODE == "cloud":
         try:
-            ws = client.open("FinanceData").worksheet("Settings")
-        except:
-            # 若無 Settings 分頁，嘗試建立 (通常需手動建立較保險)
-            st.warning("找不到 'Settings' 分頁，請在 Google Sheet 中新增名為 'Settings' 的分頁。")
-            return
+            client = get_gsheet_client()
+            try:
+                ws = client.open("FinanceData").worksheet("Settings")
+                ws.update('A1', [[json.dumps(data, ensure_ascii=False)]])
+            except:
+                st.warning("雲端無 'Settings' 分頁，設定無法儲存。")
+    else:
+        with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
 
-        json_str = json.dumps(settings_data, ensure_ascii=False)
-        ws.update('A1', [[json_str]])
-    except Exception as e:
-        st.error(f"設定儲存失敗: {e}")
+def append_record(record_dict):
+    if MODE == "cloud":
+        try:
+            client = get_gsheet_client()
+            sheet = client.open("FinanceData").sheet1
+            # 順序必須對應
+            row = [
+                str(record_dict['日期']), record_dict['專案'], record_dict['類別'], record_dict['項目內容'],
+                record_dict['單位'], record_dict['數量'], record_dict['單價'], record_dict['總價'],
+                record_dict['購買地點'], record_dict['經手人'], record_dict['憑證類型'],
+                str(record_dict['發票號碼']), record_dict['備註']
+            ]
+            sheet.append_row(row)
+            load_data.clear()
+        except Exception as e:
+            st.error(f"雲端寫入錯誤: {e}")
+    else:
+        current_df = load_data()
+        new_df = pd.DataFrame([record_dict])
+        updated_df = pd.concat([current_df, new_df], ignore_index=True)
+        save_dataframe(updated_df)
 
-# --- 備份功能 (ZIP) ---
-def create_zip_backup(df, settings, target_project=None):
+def create_zip_backup(df, settings, target_project):
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+        # 資料部分
         if target_project and target_project != "所有專案 (完整系統)":
-            # 備份單一專案
-            if not df.empty:
-                proj_df = df[df['專案'] == target_project]
-                csv_buffer = io.StringIO()
-                proj_df.to_csv(csv_buffer, index=False, encoding='utf-8-sig')
-                zip_file.writestr('finance_data.csv', csv_buffer.getvalue())
-            
-            proj_settings = {
+            df_out = df[df['專案'] == target_project] if not df.empty else df
+            # 設定檔部分需過濾
+            s_out = {
                 "projects": [target_project],
                 "cat_config": settings.get("cat_config", DEFAULT_CAT_CONFIG),
                 "items": {target_project: settings.get("items", {}).get(target_project, {})},
                 "locations": {target_project: settings.get("locations", {}).get(target_project, {})}
             }
-            zip_file.writestr('finance_settings.json', json.dumps(proj_settings, ensure_ascii=False, indent=4))
         else:
-            # 備份全部
-            if not df.empty:
-                csv_buffer = io.StringIO()
-                df.to_csv(csv_buffer, index=False, encoding='utf-8-sig')
-                zip_file.writestr('finance_data.csv', csv_buffer.getvalue())
-            zip_file.writestr('finance_settings.json', json.dumps(settings, ensure_ascii=False, indent=4))
+            df_out = df
+            s_out = settings
+            
+        csv_buffer = io.StringIO()
+        df_out.to_csv(csv_buffer, index=False, encoding='utf-8-sig')
+        zip_file.writestr('finance_data.csv', csv_buffer.getvalue())
+        zip_file.writestr('finance_settings.json', json.dumps(s_out, ensure_ascii=False, indent=4))
+        
     buffer.seek(0)
     return buffer
 
-# ==========================================
-# 2. 輔助函式與報表
-# ==========================================
-
+# --- 輔助函式 ---
 def get_date_info(date_obj):
     if isinstance(date_obj, str):
         try: date_obj = datetime.strptime(date_obj, "%Y-%m-%d").date()
@@ -222,6 +226,7 @@ def get_date_info(date_obj):
     if is_weekend: return f"🔴 {w_str}", True 
     return f"{w_str}", False
 
+# --- PDF 生成 ---
 def generate_pdf_report(df, project_name, year, month):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=1.0*cm, leftMargin=1.0*cm, topMargin=1.5*cm, bottomMargin=1.5*cm)
@@ -229,7 +234,7 @@ def generate_pdf_report(df, project_name, year, month):
     font_path = FONT_FILE 
     if not os.path.exists(font_path):
         font_main = 'Helvetica'; font_bold = 'Helvetica-Bold'
-        st.warning(f"⚠️ 找不到 {FONT_FILE}，請確認已上傳。")
+        st.toast(f"⚠️ 找不到 {FONT_FILE}，使用預設字型。")
     else:
         try:
             pdfmetrics.registerFont(TTFont(FONT_NAME, font_path))
@@ -316,7 +321,11 @@ def generate_pdf_report(df, project_name, year, month):
 settings = load_settings()
 df = load_data()
 
-st.title("🏗️ 勁翔營造 工地計帳系統 (線上版)")
+st.title("🏗️ 勁翔營造 工地計帳系統")
+if MODE == "local":
+    st.warning("⚠️ 單機模式：資料僅儲存於電腦 (finance_data.csv)，未同步至雲端。")
+else:
+    st.success("☁️ 雲端連線模式：資料同步儲存於 Google Sheets。")
 
 if 'last_check_date' not in st.session_state:
     st.session_state.last_check_date = datetime.now().date()
@@ -324,7 +333,6 @@ if 'last_check_date' not in st.session_state:
 with st.sidebar:
     st.header("📅 專案選擇")
     if not settings["projects"]: settings["projects"] = ["預設專案"]
-    
     current_proj_idx = 0
     if "global_project" in st.session_state and st.session_state.global_project in settings["projects"]:
         current_proj_idx = settings["projects"].index(st.session_state.global_project)
@@ -333,11 +341,9 @@ with st.sidebar:
     st.session_state.global_project = global_project
 
     global_date = st.date_input("記帳日期", st.session_state.last_check_date)
-    
     if global_date != st.session_state.last_check_date:
         st.session_state.last_check_date = global_date
         components.html("""<script>var tabs=window.parent.document.querySelectorAll('[data-testid="stTab"]');if(tabs.length>0){tabs[0].click();}</script>""", height=0, width=0)
-
     day_str, is_red = get_date_info(global_date)
     if is_red: st.markdown(f"<h3 style='color: #FF4B4B;'>{global_date} {day_str}</h3>", unsafe_allow_html=True)
     else: st.markdown(f"### {global_date} {day_str}")
@@ -371,7 +377,12 @@ with tab_entry:
         note = st.session_state.get(k_note, "")
         if not final_item: st.toast(f"❌ 請輸入 {display_name} 的項目/來源！", icon="⚠️"); return
 
-        append_finance_record(global_date, global_project, conf_key, final_item, unit, qty, price, location, handler, r_type, inv_no, note)
+        record = {
+            '日期': global_date, '專案': global_project, '類別': conf_key, '項目內容': final_item,
+            '單位': unit, '數量': qty, '單價': price, '總價': qty*price, '購買地點': location,
+            '經手人': handler, '憑證類型': r_type, '發票號碼': inv_no, '備註': note
+        }
+        append_record(record)
         st.toast(f"✅ {display_name} 儲存成功！")
         st.session_state[k_man] = ""; st.session_state[k_price] = 0; st.session_state[k_note] = ""; st.session_state[k_buyer] = ""
         if conf_type != "income": st.session_state[k_man_loc] = ""; st.session_state[k_inv] = ""; st.session_state[k_qty] = 1.0
@@ -380,15 +391,17 @@ with tab_entry:
         icon = "💰" if conf["type"] == "income" else "💸"
         k_sel = f"sel_{conf['key']}"; k_man = f"man_{conf['key']}"; k_price = f"price_{conf['key']}"
         k_buyer = f"buyer_{conf['key']}"; k_note = f"note_{conf['key']}"; k_sel_loc = f"sel_loc_{conf['key']}"
-        k_man_loc = f"man_loc_{conf_key}"; k_type = f"type_{conf['key']}"; k_inv = f"inv_{conf['key']}"
+        k_man_loc = f"man_loc_{conf['key']}"; k_type = f"type_{conf['key']}"; k_inv = f"inv_{conf['key']}"
         k_qty = f"qty_{conf['key']}"; k_unit = f"unit_{conf['key']}"
         if k_man not in st.session_state: st.session_state[k_man] = ""
         if k_price not in st.session_state: st.session_state[k_price] = 0
         if k_qty not in st.session_state: st.session_state[k_qty] = 1.0
+        
         with st.expander(f"{icon} {conf['display']}", expanded=False):
             col1, col2 = st.columns(2)
             items_list = settings["items"].get(global_project, {}).get(conf["key"], [])
             items_with_manual = items_list + ["✏️ 手動輸入..."]
+            
             if conf["type"] == "income":
                 with col1:
                     sel = st.selectbox("入帳來源", items_with_manual, key=k_sel)
@@ -430,6 +443,7 @@ with tab_data:
         view_df = year_df.copy()
         if sel_month != "整年": view_df = view_df[view_df['月份'] == sel_month]
         if search_kw: view_df = view_df[view_df['項目內容'].str.contains(search_kw, case=False) | view_df['備註'].str.contains(search_kw, case=False) | view_df['發票號碼'].str.contains(search_kw, case=False)]
+        
         st.divider()
         if view_df.empty: st.warning("查無符合條件的資料")
         else:
@@ -446,44 +460,46 @@ with tab_data:
                     cols_to_show = ['刪除', '日期', '星期/節日', '項目內容', '單位', '數量', '單價', '總價', '購買地點', '經手人', '憑證類型', '發票號碼', '備註']
                     cols_to_show = [c for c in cols_to_show if c in cat_df.columns]
                     cat_df = cat_df[cols_to_show]
+                    
                     if conf['type'] == 'income':
                         col_config = {"刪除": st.column_config.CheckboxColumn(width="small"), "總價": st.column_config.NumberColumn(format="$%d", disabled=True), "日期": st.column_config.DateColumn(format="YYYY-MM-DD", width="small"), "星期/節日": st.column_config.TextColumn(disabled=True, width="small"), "項目內容": st.column_config.TextColumn("入帳來源"), "購買地點": None, "憑證類型": None, "發票號碼": None, "數量": None, "單位": None}
                     else:
                         col_config = {"刪除": st.column_config.CheckboxColumn(width="small"), "總價": st.column_config.NumberColumn(format="$%d", disabled=True), "日期": st.column_config.DateColumn(format="YYYY-MM-DD", width="small"), "星期/節日": st.column_config.TextColumn(disabled=True, width="small")}
+                    
                     edited_cat = st.data_editor(cat_df.sort_values('日期', ascending=False), column_config=col_config, use_container_width=True, num_rows="dynamic", key=f"editor_{conf['key']}_{sel_year}_{sel_month}", hide_index=True)
                     
                     c_btn1, c_btn2, _ = st.columns([1, 1, 4])
                     if c_btn1.button("💾 更新修改", key=f"btn_upd_{conf['key']}"):
-                        if search_kw: st.error("搜尋模式下無法存檔！請先清除搜尋關鍵字。")
+                        if search_kw: st.error("搜尋模式下無法存檔！")
                         else:
-                            final_df = edited_cat.copy()
-                            final_df['數量'] = pd.to_numeric(final_df['數量'], errors='coerce').fillna(0)
-                            final_df['單價'] = pd.to_numeric(final_df['單價'], errors='coerce').fillna(0)
-                            final_df['總價'] = final_df['數量'] * final_df['單價']
-                            final_df['類別'] = conf['key']; final_df['專案'] = global_project
-                            current_full_df = df
-                            mask_target = (current_full_df['專案'] == global_project) & (current_full_df['類別'] == conf['key']) & (current_full_df['Year'] == sel_year)
-                            if sel_month != "整年": mask_target = mask_target & (current_full_df['月份'] == sel_month)
-                            df_kept = current_full_df[~mask_target]
-                            df_to_add = final_df.drop(columns=['刪除', '星期/節日'], errors='ignore')
-                            full_new_df = pd.concat([df_kept, df_to_add], ignore_index=True)
-                            if save_dataframe(full_new_df): st.success("✅ 更新成功！"); time.sleep(1); st.rerun()
+                            with st.spinner("正在更新資料庫..."):
+                                final_df = edited_cat.copy()
+                                final_df['數量'] = pd.to_numeric(final_df['數量'], errors='coerce').fillna(0)
+                                final_df['單價'] = pd.to_numeric(final_df['單價'], errors='coerce').fillna(0)
+                                final_df['總價'] = final_df['數量'] * final_df['單價']
+                                final_df['類別'] = conf['key']; final_df['專案'] = global_project
+                                current_full_df = df
+                                mask = (current_full_df['專案'] == global_project) & (current_full_df['類別'] == conf['key']) & (current_full_df['Year'] == sel_year)
+                                if sel_month != "整年": mask = mask & (current_full_df['月份'] == sel_month)
+                                df_kept = current_full_df[~mask]
+                                df_add = final_df.drop(columns=['刪除', '星期/節日'], errors='ignore')
+                                if save_dataframe(pd.concat([df_kept, df_add], ignore_index=True)): st.success("更新成功！"); time.sleep(1); st.rerun()
+
                     if c_btn2.button("🗑️ 刪除選取", key=f"btn_del_{conf['key']}"):
-                        if not edited_cat['刪除'].any(): st.warning("請先勾選表格內的「刪除」框框")
-                        elif search_kw: st.error("搜尋模式下無法執行刪除")
+                        if not edited_cat['刪除'].any(): st.warning("請勾選刪除項目")
+                        elif search_kw: st.error("搜尋模式下無法刪除")
                         else:
-                            rows_to_keep = edited_cat[edited_cat['刪除'] == False].copy()
-                            current_full_df = df
-                            mask_target = (current_full_df['專案'] == global_project) & (current_full_df['類別'] == conf['key']) & (current_full_df['Year'] == sel_year)
-                            if sel_month != "整年": mask_target = mask_target & (current_full_df['月份'] == sel_month)
-                            df_kept = current_full_df[~mask_target]
-                            df_to_add = rows_to_keep.drop(columns=['刪除', '星期/節日'], errors='ignore')
-                            df_to_add['類別'] = conf['key']; df_to_add['專案'] = global_project
-                            df_to_add['數量'] = pd.to_numeric(df_to_add['數量'], errors='coerce').fillna(0)
-                            df_to_add['單價'] = pd.to_numeric(df_to_add['單價'], errors='coerce').fillna(0)
-                            df_to_add['總價'] = df_to_add['數量'] * df_to_add['單價']
-                            full_new_df = pd.concat([df_kept, df_to_add], ignore_index=True)
-                            if save_dataframe(full_new_df): st.success("已刪除選取項目"); time.sleep(1); st.rerun()
+                            with st.spinner("正在刪除..."):
+                                rows_keep = edited_cat[edited_cat['刪除'] == False].copy()
+                                current_full_df = df
+                                mask = (current_full_df['專案'] == global_project) & (current_full_df['類別'] == conf['key']) & (current_full_df['Year'] == sel_year)
+                                if sel_month != "整年": mask = mask & (current_full_df['月份'] == sel_month)
+                                df_kept = current_full_df[~mask]
+                                df_add = rows_keep.drop(columns=['刪除', '星期/節日'], errors='ignore')
+                                # 補齊必要欄位避免錯誤
+                                df_add['類別'] = conf['key']; df_add['專案'] = global_project
+                                df_add['總價'] = pd.to_numeric(df_add['數量'], errors='coerce') * pd.to_numeric(df_add['單價'], errors='coerce')
+                                if save_dataframe(pd.concat([df_kept, df_add], ignore_index=True)): st.success("已刪除"); time.sleep(1); st.rerun()
                     st.markdown("---")
 
 # --- Tab 3: 收支儀表板 ---
@@ -510,157 +526,148 @@ with tab_dash:
         rpt_data_y = dash_df[dash_df['Year'] == rpt_sel_year]
         rpt_months = sorted(rpt_data_y['月份'].unique().tolist(), reverse=True)
         with c_rpt_m: rpt_sel_month = st.selectbox("報表月份", ["整年度"] + rpt_months, key="rpt_m")
-        if st.button("📥 下載 PDF 報表檔案"):
+        if st.button("📥 下載 PDF 報表"):
             rpt_df = rpt_data_y.copy()
             if rpt_sel_month != "整年度": rpt_df = rpt_df[rpt_df['月份'] == rpt_sel_month]
             pdf_data = generate_pdf_report(rpt_df, global_project, rpt_sel_year, rpt_sel_month)
             file_name = f"財務報表_{global_project}_{rpt_sel_year}_{rpt_sel_month}.pdf"
-            st.download_button(label="📥 點此下載 PDF (標楷體)", data=pdf_data, file_name=file_name, mime="application/pdf")
+            st.download_button("📥 點此下載 PDF", data=pdf_data, file_name=file_name, mime="application/pdf")
 
-# --- Tab 4: 設定與管理 (含完整備份/匯入/修改功能) ---
+# --- Tab 4: 設定與管理 (全功能回歸) ---
 with tab_settings:
     st.header("⚙️ 設定與管理")
     st.markdown("### 一、專案管理")
-    with st.expander("1. 資料備份與還原 (ZIP/CSV)", expanded=False):
-        backup_target = st.selectbox("選擇要備份的對象", ["所有專案 (完整系統)", global_project])
-        st.download_button(f"📦 下載備份 ({backup_target})", create_zip_backup(df, settings, target_project=backup_target), file_name=f"backup_{backup_target}_{datetime.now().strftime('%Y%m%d')}.zip", mime="application/zip")
+    with st.expander("1. 資料備份與還原", expanded=False):
+        backup_target = st.selectbox("備份對象", ["所有專案 (完整系統)", global_project])
+        st.download_button(f"📦 下載備份 ({backup_target})", create_zip_backup(df, settings, backup_target), file_name=f"backup_{datetime.now().strftime('%Y%m%d')}.zip", mime="application/zip")
         st.divider()
-        uploaded_file = st.file_uploader("📤 系統還原 (請上傳 ZIP 或 CSV)", type=['csv', 'zip'])
-        if uploaded_file:
-            if st.button("開始還原"):
-                try:
-                    if uploaded_file.name.endswith('.csv'):
-                        pd.read_csv(uploaded_file).to_csv(DATA_FILE, index=False, encoding='utf-8-sig'); st.success("CSV 資料還原成功！")
-                    elif uploaded_file.name.endswith('.zip'):
-                        with zipfile.ZipFile(uploaded_file, 'r') as z:
-                            if DATA_FILE in z.namelist():
-                                with open(DATA_FILE, 'wb') as f: f.write(z.read(DATA_FILE))
-                            if SETTINGS_FILE in z.namelist():
-                                with open(SETTINGS_FILE, 'wb') as f: f.write(z.read(SETTINGS_FILE))
-                        st.success("ZIP 還原成功！")
-                    time.sleep(1); st.rerun()
-                except Exception as e: st.error(f"還原失敗: {e}")
+        uploaded_file = st.file_uploader("📤 系統還原 (ZIP/CSV)", type=['csv', 'zip'])
+        if uploaded_file and st.button("開始還原"):
+            try:
+                if uploaded_file.name.endswith('.csv'):
+                    if save_dataframe(pd.read_csv(uploaded_file)): st.success("CSV 還原成功！")
+                elif uploaded_file.name.endswith('.zip'):
+                    with zipfile.ZipFile(uploaded_file, 'r') as z:
+                        if 'finance_data.csv' in z.namelist(): save_dataframe(pd.read_csv(z.open('finance_data.csv')))
+                        if 'finance_settings.json' in z.namelist(): save_settings(json.load(z.open('finance_settings.json')))
+                    st.success("ZIP 還原成功！")
+                time.sleep(1); st.rerun()
+            except Exception as e: st.error(f"還原失敗: {e}")
 
     with st.expander("2. 專案管理 (新增/匯入/改名/刪除)", expanded=True):
         c1, c2 = st.columns(2)
         with c1:
-            st.subheader("新增與改名")
             new_proj = st.text_input("新增專案名稱")
-            if st.button("➕ 新增專案"):
+            if st.button("➕ 新增"):
                 if new_proj and new_proj not in settings["projects"]:
                     settings["projects"].append(new_proj)
                     settings["items"][new_proj] = {c["key"]: [] for c in settings["cat_config"]}
                     settings["locations"][new_proj] = {c["key"]: [] for c in settings["cat_config"]}
-                    save_json(SETTINGS_FILE, settings); st.success(f"已新增：{new_proj}"); time.sleep(1); st.rerun()
+                    save_settings(settings); st.success("已新增"); st.rerun()
             st.divider()
-            rename_proj = st.text_input("修改目前專案名稱", value=global_project)
-            if st.button("✏️ 確認改名"):
+            rename_proj = st.text_input("改名目前專案", value=global_project)
+            if st.button("✏️ 改名"):
                 if rename_proj and rename_proj != global_project:
                     settings["projects"] = [rename_proj if p == global_project else p for p in settings["projects"]]
                     settings["items"][rename_proj] = settings["items"].pop(global_project)
                     settings["locations"][rename_proj] = settings["locations"].pop(global_project)
-                    save_json(SETTINGS_FILE, settings)
-                    if not df.empty: df.loc[df['專案'] == global_project, '專案'] = rename_proj; save_dataframe(df)
-                    st.success(f"專案已改名為：{rename_proj}"); time.sleep(1); st.rerun()
+                    save_settings(settings)
+                    if not df.empty:
+                        df.loc[df['專案'] == global_project, '專案'] = rename_proj
+                        save_dataframe(df)
+                    st.success("專案已改名"); st.rerun()
         with c2:
-            st.subheader("匯入與刪除")
-            other_projects = [p for p in settings["projects"] if p != global_project]
-            if other_projects:
-                source_proj = st.selectbox("📥 從其他專案匯入設定", other_projects)
+            op = [p for p in settings["projects"] if p != global_project]
+            if op:
+                source_proj = st.selectbox("📥 匯入來源", op)
                 if st.button("匯入設定"):
-                    s_items = settings["items"].get(source_proj, {}); t_items = settings["items"].get(global_project, {})
-                    s_locs = settings["locations"].get(source_proj, {}); t_locs = settings["locations"].get(global_project, {})
-                    for cat, items in s_items.items():
-                        for item in items:
-                            if item not in t_items[cat]: t_items[cat].append(item)
-                    for cat, locs in s_locs.items():
-                        for loc in locs:
-                            if loc not in t_locs[cat]: t_locs[cat].append(loc)
-                    save_json(SETTINGS_FILE, settings); st.success("匯入完成！"); time.sleep(1); st.rerun()
+                    s_i = settings["items"].get(source_proj, {}); t_i = settings["items"].get(global_project, {})
+                    s_l = settings["locations"].get(source_proj, {}); t_l = settings["locations"].get(global_project, {})
+                    for c, items in s_i.items():
+                        for it in items: 
+                            if it not in t_i[c]: t_i[c].append(it)
+                    for c, locs in s_l.items():
+                        for l in locs:
+                            if l not in t_l[c]: t_l[c].append(l)
+                    save_settings(settings); st.success("匯入完成"); st.rerun()
             st.divider()
             if st.button("🗑️ 刪除此專案"):
-                if len(settings["projects"]) <= 1: st.error("無法刪除最後一個專案！")
+                if len(settings["projects"]) <= 1: st.error("無法刪除最後一個專案")
                 else:
                     settings["projects"].remove(global_project)
                     del settings["items"][global_project]; del settings["locations"][global_project]
-                    save_json(SETTINGS_FILE, settings)
+                    save_settings(settings)
                     if not df.empty: save_dataframe(df[df['專案'] != global_project])
-                    st.success("專案已刪除"); time.sleep(1); st.rerun()
+                    st.success("專案已刪除"); st.rerun()
 
     st.markdown("### 二、分類管理")
-    with st.expander("1. 大項管理 (新增/修改/刪除記帳類別)", expanded=False):
+    with st.expander("1. 大項管理 (類別)", expanded=False):
         nc1, nc2, nc3 = st.columns([2, 1, 1])
-        with nc1: new_cat_name = st.text_input("新增類別名稱 (例：08. 人事費)")
-        with nc2: new_cat_type = st.selectbox("類型", ["expense", "income"], format_func=lambda x: "支出" if x=="expense" else "收入")
+        with nc1: new_cat = st.text_input("類別名稱")
+        with nc2: new_type = st.selectbox("類型", ["expense", "income"])
         with nc3: 
             st.write(""); 
             if st.button("新增類別"):
-                if new_cat_name and not any(c['key'] == new_cat_name for c in settings["cat_config"]):
-                    settings["cat_config"].append({"key": new_cat_name, "display": new_cat_name, "type": new_cat_type})
-                    for proj in settings["items"]:
-                        settings["items"][proj][new_cat_name] = []; settings["locations"][proj][new_cat_name] = []
-                    save_json(SETTINGS_FILE, settings); st.success("已新增"); time.sleep(0.5); st.rerun()
-        
-        st.divider()
-        for idx, cat in enumerate(settings["cat_config"]):
-            c_label, c_input, c_btn, c_del = st.columns([2, 3, 1, 1])
-            with c_label: st.text(f"原: {cat['display']}")
-            with c_input: new_display = st.text_input(f"新名稱 {idx}", value=cat["display"], label_visibility="collapsed", key=f"cat_ren_{idx}")
-            with c_btn:
-                if st.button("更新", key=f"btn_upd_cat_{idx}"):
-                    settings["cat_config"][idx]["display"] = new_display
-                    save_json(SETTINGS_FILE, settings); st.success("已更新"); time.sleep(0.5); st.rerun()
-            with c_del:
-                if st.button("刪", key=f"btn_del_cat_{idx}"):
-                    settings["cat_config"].pop(idx); save_json(SETTINGS_FILE, settings); st.rerun()
+                if new_cat and not any(c['key'] == new_cat for c in settings["cat_config"]):
+                    settings["cat_config"].append({"key": new_cat, "display": new_cat, "type": new_type})
+                    for p in settings["items"]:
+                        settings["items"][p][new_cat] = []; settings["locations"][p][new_cat] = []
+                    save_settings(settings); st.rerun()
+        for i, c in enumerate(settings["cat_config"]):
+            c1, c2, c3 = st.columns([3, 1, 1])
+            with c1: new_disp = st.text_input(f"名稱 {i}", c['display'], key=f"rn_{i}", label_visibility="collapsed")
+            with c2: 
+                if st.button("更", key=f"up_{i}"): 
+                    settings["cat_config"][i]["display"] = new_disp; save_settings(settings); st.rerun()
+            with c3:
+                if st.button("刪", key=f"dl_{i}"):
+                    settings["cat_config"].pop(i); save_settings(settings); st.rerun()
 
-    with st.expander("2. 細項選單管理 (新增/改名/刪除)", expanded=True):
-        target_cat = st.selectbox("選擇要管理的大項", [c["display"] for c in settings["cat_config"]])
-        cat_key = next(c["key"] for c in settings["cat_config"] if c["display"] == target_cat)
-        cat_type = next(c["type"] for c in settings["cat_config"] if c["display"] == target_cat)
+    with st.expander("2. 細項管理 (項目/地點)", expanded=True):
+        t_cat = st.selectbox("選擇大項", [c["display"] for c in settings["cat_config"]])
+        c_key = next(c["key"] for c in settings["cat_config"] if c["display"] == t_cat)
+        c_type = next(c["type"] for c in settings["cat_config"] if c["display"] == t_cat)
         
+        # 確保結構
         if global_project not in settings["items"]: settings["items"][global_project] = {c["key"]: [] for c in settings["cat_config"]}
-        if cat_key not in settings["items"][global_project]: settings["items"][global_project][cat_key] = []
+        if c_key not in settings["items"][global_project]: settings["items"][global_project][c_key] = []
         if global_project not in settings["locations"]: settings["locations"][global_project] = {c["key"]: [] for c in settings["cat_config"]}
+
+        list_type = "item"
+        if c_type != "income":
+            mode = st.radio("管理清單", ["內容 (Items)", "地點 (Locations)"], horizontal=True)
+            list_type = "item" if "內容" in mode else "location"
         
-        if cat_type == "income":
-            list_type = "item"; current_list = settings["items"][global_project][cat_key]
-        else:
-            mode_sel = st.radio("選擇要管理的清單", ["📦 購買內容 (Items)", "📍 購買地點 (Locations)"], horizontal=True)
-            list_type = "item" if "內容" in mode_sel else "location"
-            current_list = settings["items"][global_project][cat_key] if list_type == "item" else settings["locations"][global_project][cat_key]
+        curr_list = settings["items"][global_project][c_key] if list_type == "item" else settings["locations"][global_project][c_key]
         
         c_add1, c_add2 = st.columns([4, 1])
-        with c_add1: new_item = st.text_input("輸入名稱新增", key="new_item_input")
+        with c_add1: new_it = st.text_input("新項目名稱")
         with c_add2:
-            if st.button("➕ 加入", key="btn_add_item"):
-                if new_item and new_item not in current_list:
-                    if list_type == "item": settings["items"][global_project][cat_key].append(new_item)
-                    else: settings["locations"][global_project][cat_key].append(new_item)
-                    save_json(SETTINGS_FILE, settings); st.success("已加入"); st.rerun()
+            if st.button("➕"):
+                if new_it and new_it not in curr_list:
+                    if list_type == "item": settings["items"][global_project][c_key].append(new_it)
+                    else: settings["locations"][global_project][c_key].append(new_it)
+                    save_settings(settings); st.rerun()
         
-        if current_list:
-            st.markdown(f"#### 管理現有項目")
-            h1, h2, h3, h4 = st.columns([2, 3, 1, 1]); h1.markdown("**原名稱**"); h2.markdown("**改名**"); h3.markdown("**存**"); h4.markdown("**刪**")
-            for i, item in enumerate(current_list):
-                ic1, ic2, ic3, ic4 = st.columns([2, 3, 1, 1])
-                with ic1: st.text(item)
-                with ic2: ren_item = st.text_input("改名", value=item, key=f"ren_{list_type}_{i}", label_visibility="collapsed")
-                with ic3:
-                    if st.button("💾", key=f"save_{list_type}_{i}"):
-                        if list_type == "item":
-                            settings["items"][global_project][cat_key][i] = ren_item
-                            if not df.empty:
-                                mask = (df['專案'] == global_project) & (df['類別'] == cat_key) & (df['項目內容'] == item)
-                                df.loc[mask, '項目內容'] = ren_item; save_dataframe(df)
-                        else:
-                            settings["locations"][global_project][cat_key][i] = ren_item
-                            if not df.empty:
-                                mask = (df['專案'] == global_project) & (df['類別'] == cat_key) & (df['購買地點'] == item)
-                                df.loc[mask, '購買地點'] = ren_item; save_dataframe(df)
-                        save_json(SETTINGS_FILE, settings); st.success("已更新"); time.sleep(0.5); st.rerun()
-                with ic4:
-                    if st.button("🗑️", key=f"del_{list_type}_{i}"):
-                        if list_type == "item": settings["items"][global_project][cat_key].remove(item)
-                        else: settings["locations"][global_project][cat_key].remove(item)
-                        save_json(SETTINGS_FILE, settings); st.rerun()
+        for i, it in enumerate(curr_list):
+            ic1, ic2, ic3, ic4 = st.columns([2, 3, 1, 1])
+            with ic1: st.text(it)
+            with ic2: rn = st.text_input("改名", it, key=f"rni_{i}", label_visibility="collapsed")
+            with ic3:
+                if st.button("💾", key=f"sv_{i}"):
+                    if list_type == "item":
+                        settings["items"][global_project][c_key][i] = rn
+                        if not df.empty:
+                            mask = (df['專案'] == global_project) & (df['類別'] == c_key) & (df['項目內容'] == it)
+                            df.loc[mask, '項目內容'] = rn; save_dataframe(df)
+                    else:
+                        settings["locations"][global_project][c_key][i] = rn
+                        if not df.empty:
+                            mask = (df['專案'] == global_project) & (df['類別'] == c_key) & (df['購買地點'] == it)
+                            df.loc[mask, '購買地點'] = rn; save_dataframe(df)
+                    save_settings(settings); st.success("已更新"); time.sleep(0.5); st.rerun()
+            with ic4:
+                if st.button("🗑️", key=f"rm_{i}"):
+                    if list_type == "item": settings["items"][global_project][c_key].remove(it)
+                    else: settings["locations"][global_project][c_key].remove(it)
+                    save_settings(settings); st.rerun()
