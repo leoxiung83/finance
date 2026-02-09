@@ -31,7 +31,7 @@ except ImportError:
     HAS_PDF_LIB = False
 
 # 設定頁面 (標題已修改)
-st.set_page_config(page_title="勁翔營造股份有限公司 計帳系統", layout="wide", page_icon="🏗️")
+st.set_page_config(page_title="勁翔營造工地記帳系統", layout="wide", page_icon="🏗️")
 
 # --- 檔案與字型設定 (使用絕對路徑) ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -410,7 +410,7 @@ def show_delete_confirmation(edited_cat_snapshot, global_proj, conf_key, sel_y, 
 settings = load_settings()
 df = load_data()
 
-st.title("🏗️ 勁翔營造股份有限公司 計帳系統")
+st.title("🏗️ 勁翔營造工地記帳系統")
 
 if 'last_check_date' not in st.session_state:
     st.session_state.last_check_date = datetime.now().date()
@@ -916,3 +916,4 @@ with tab_settings:
                                 save_settings(settings); st.session_state[del_sub_key] = False; st.rerun()
                             if st.button("❌", key=f"no_{list_type}_{i}"): st.session_state[del_sub_key] = False; st.rerun()
         else: st.info(f"此類別目前沒有設定常用{manage_mode_display.split()[1]}。")
+
