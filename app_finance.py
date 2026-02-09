@@ -372,7 +372,7 @@ def generate_pdf_report(df, project_name, year, month):
 settings = load_settings()
 df = load_data()
 
-st.title("🏗️ 勁翔營造 工地計帳系統")
+st.title("🏗️ 勁翔營造 工地計帳系統(線上版)")
 
 if 'last_check_date' not in st.session_state:
     st.session_state.last_check_date = datetime.now().date()
@@ -936,4 +936,5 @@ with tab_settings:
                             if st.button("❌", key=f"no_{list_type}_{i}"): st.session_state[del_sub_key] = False; st.rerun()
 
         else: st.info(f"此類別目前沒有設定常用{manage_mode_display.split()[1]}。")
+
 
