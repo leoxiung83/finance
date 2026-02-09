@@ -31,7 +31,7 @@ except ImportError:
     HAS_PDF_LIB = False
 
 # 設定頁面
-st.set_page_config(page_title="勁翔營造 工地計帳系統", layout="wide", page_icon="🏗️")
+st.set_page_config(page_title="勁翔營造 工地計帳系統(線上版)", layout="wide", page_icon="🏗️")
 
 # --- 檔案與字型設定 ---
 DATA_FILE = 'finance_data.csv'
@@ -934,4 +934,5 @@ with tab_settings:
                                 settings["locations"][global_project][cat_key].remove(item)
                                 save_settings(settings); st.session_state[del_sub_key] = False; st.rerun()
                             if st.button("❌", key=f"no_{list_type}_{i}"): st.session_state[del_sub_key] = False; st.rerun()
+
         else: st.info(f"此類別目前沒有設定常用{manage_mode_display.split()[1]}。")
