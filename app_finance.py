@@ -43,8 +43,10 @@ FONT_NAME = 'Kaiu'
 # --- 關鍵修正：安全檢查 Secrets 是否存在 ---
 def safe_check_secrets():
     try:
-        if st.secrets is not None and "gcp_service_account" in st.secrets:
-            return True
+        # 這裡用最安全的方式檢查，防止舊版 Streamlit 崩潰
+        if hasattr(st, "secrets") and st.secrets is not None:
+            if "gcp_service_account" in st.secrets:
+                return True
     except:
         return False
     return False
@@ -361,48 +363,6 @@ def generate_pdf_report(df, project_name, year, month):
     buffer.seek(0)
     return buffer
 
-# --- [新增功能] 刪除確認視窗 (使用 st.dialog 防止小人跑動) ---
-@st.dialog("⚠️ 確認刪除資料")
-def show_delete_confirmation(edited_cat_snapshot, global_proj, conf_key, sel_y, sel_m):
-    # 計算出原本要被刪除的資料
-    rows_to_del = edited_cat_snapshot[edited_cat_snapshot['刪除'] == True]
-    st.warning(f"您即將永久刪除 {len(rows_to_del)} 筆資料，此動作無法復原。")
-    st.write("確定要繼續嗎？")
-    
-    col_y, col_n = st.columns(2)
-    
-    if col_y.button("✔️ 是，刪除", type="primary", key="dialog_confirm_del"):
-        with st.spinner("處理中..."):
-            # 重新讀取最新的完整資料，避免版本衝突
-            current_full_df = load_data()
-            
-            # 建構篩選邏輯，找出屬於當前檢視範圍的資料 (專案+類別+年份+月份)
-            mask = (current_full_df['專案'] == global_proj) & (current_full_df['類別'] == conf_key) & (current_full_df['Year'] == sel_y)
-            if sel_m != "整年":
-                mask = mask & (current_full_df['月份'] == sel_m)
-            
-            # 從編輯過的快照中，保留「刪除=False」的資料
-            rows_keep = edited_cat_snapshot[edited_cat_snapshot['刪除'] == False].copy()
-            
-            # 整理要寫回的資料結構
-            df_kept_outside = current_full_df[~mask] # 原本就不在這次編輯範圍內的資料(保留)
-            
-            # 整理這次編輯後的資料 (要寫入的)
-            df_add = rows_keep.drop(columns=['刪除', '星期/節日'], errors='ignore')
-            df_add['類別'] = conf_key
-            df_add['專案'] = global_proj
-            # 重算總價以防萬一
-            df_add['總價'] = pd.to_numeric(df_add['數量'], errors='coerce') * pd.to_numeric(df_add['單價'], errors='coerce')
-            
-            # 合併並存檔
-            if save_dataframe(pd.concat([df_kept_outside, df_add], ignore_index=True)):
-                st.success("已刪除！")
-                time.sleep(0.5)
-                st.rerun() # 這裡的 rerun 會關閉視窗並刷新主頁面
-                
-    if col_n.button("❌ 否，取消", key="dialog_cancel_del"):
-        st.rerun() # 這裡的 rerun 會單純關閉視窗，不執行任何動作
-
 # ==========================================
 # 3. UI 介面
 # ==========================================
@@ -511,11 +471,12 @@ with tab_entry:
                                 st.toast(f"✅ {conf['display']} 儲存成功！")
                                 time.sleep(0.5)
 
-# --- Tab 2: 明細管理 (關鍵修改：使用 st.dialog 取代原有刪除流程) ---
+# --- Tab 2: 明細管理 ---
 with tab_data:
     proj_df = df[df['專案'] == global_project].copy()
     if proj_df.empty: st.info("⚠️ 本專案尚無任何資料")
     else:
+        # 篩選區塊 Form (輸入時不重整)
         with st.form(key="filter_form"):
             c_filter1, c_filter2, c_filter3 = st.columns([1, 1, 2])
             proj_df['Year'] = pd.to_datetime(proj_df['日期']).dt.year
@@ -557,7 +518,7 @@ with tab_data:
                     else:
                         col_config = {"刪除": st.column_config.CheckboxColumn(width="small"), "總價": st.column_config.NumberColumn(format="$%d", disabled=True), "日期": st.column_config.DateColumn(format="YYYY-MM-DD", width="small"), "星期/節日": st.column_config.TextColumn(disabled=True, width="small")}
                     
-                    # --- 表格與按鈕區 (Form) ---
+                    # --- 表格與按鈕區 (Form) (勾選時不重整) ---
                     with st.form(key=f"form_editor_{conf['key']}"):
                         edited_cat = st.data_editor(cat_df.sort_values('日期', ascending=False).reset_index(drop=True), column_config=col_config, use_container_width=True, num_rows="dynamic", key=f"editor_{conf['key']}_{sel_year}_{sel_month}", hide_index=True)
                         
@@ -567,7 +528,52 @@ with tab_data:
                         with c_btn2:
                             submit_delete = st.form_submit_button("🗑️ 刪除選取")
                     
-                    # --- 邏輯處理區 ---
+                    # --- [修正點] 刪除確認邏輯 (回復為 Inline 模式) ---
+                    # 1. 如果按下「刪除選取」，將要刪除的資料暫存到 session_state，並觸發一次重整以顯示下方按鈕
+                    if submit_delete:
+                        if not edited_cat['刪除'].any():
+                            st.warning("請先勾選要刪除的項目")
+                        elif search_kw:
+                            st.error("搜尋模式下無法執行刪除")
+                        else:
+                            st.session_state[f"pending_del_df_{conf['key']}"] = edited_cat
+                            st.session_state[f"confirm_del_{conf['key']}"] = True
+                            st.rerun()
+
+                    # 2. 如果 session_state 中有待確認標記，則顯示「是/否」按鈕
+                    if st.session_state.get(f"confirm_del_{conf['key']}"):
+                        st.warning("⚠️ 確定要永久刪除勾選的資料嗎？")
+                        col_yes, col_no = st.columns(2)
+                        
+                        # 3. 按下「是，刪除」才真正執行刪除動作
+                        if col_yes.button("✔️ 是，刪除", key=f"yes_{conf['key']}"):
+                            pending_df = st.session_state.get(f"pending_del_df_{conf['key']}")
+                            if pending_df is not None:
+                                with st.spinner("正在刪除..."):
+                                    rows_keep = pending_df[pending_df['刪除'] == False].copy()
+                                    current_full_df = df
+                                    mask = (current_full_df['專案'] == global_project) & (current_full_df['類別'] == conf['key']) & (current_full_df['Year'] == sel_year)
+                                    if sel_month != "整年": mask = mask & (current_full_df['月份'] == sel_month)
+                                    df_kept = current_full_df[~mask]
+                                    df_add = rows_keep.drop(columns=['刪除', '星期/節日'], errors='ignore')
+                                    df_add['類別'] = conf['key']; df_add['專案'] = global_project
+                                    df_add['總價'] = pd.to_numeric(df_add['數量'], errors='coerce') * pd.to_numeric(df_add['單價'], errors='coerce')
+                                    
+                                    if save_dataframe(pd.concat([df_kept, df_add], ignore_index=True)):
+                                        st.success("已刪除")
+                                        st.session_state[f"confirm_del_{conf['key']}"] = False
+                                        del st.session_state[f"pending_del_df_{conf['key']}"]
+                                        time.sleep(0.5)
+                                        st.rerun()
+                        
+                        # 4. 按下「否」則取消狀態
+                        if col_no.button("❌ 否，取消", key=f"no_{conf['key']}"):
+                            st.session_state[f"confirm_del_{conf['key']}"] = False
+                            if f"pending_del_df_{conf['key']}" in st.session_state:
+                                del st.session_state[f"pending_del_df_{conf['key']}"]
+                            st.rerun()
+
+                    # --- 更新修改按鈕邏輯 ---
                     if submit_update:
                         if search_kw: st.error("搜尋模式下無法存檔！")
                         else:
@@ -583,16 +589,6 @@ with tab_data:
                                 df_kept = current_full_df[~mask]
                                 df_add = final_df.drop(columns=['刪除', '星期/節日'], errors='ignore')
                                 if save_dataframe(pd.concat([df_kept, df_add], ignore_index=True)): st.success("更新成功！"); time.sleep(1); st.rerun()
-
-                    # --- 刪除按鈕 (改用 Dialog 觸發，不使用 Session State 造成的小人跑動) ---
-                    if submit_delete:
-                        if not edited_cat['刪除'].any():
-                            st.warning("請先勾選要刪除的項目")
-                        elif search_kw:
-                            st.error("搜尋模式下無法執行刪除")
-                        else:
-                            # 直接呼叫懸浮視窗，傳入當前的資料狀態
-                            show_delete_confirmation(edited_cat, global_project, conf['key'], sel_year, sel_month)
                     
                     st.markdown("---")
 
@@ -708,7 +704,7 @@ with tab_settings:
                     st.warning(f"確定要從 {source_proj} 匯入選單項目到 {global_project} 嗎？")
                     iy, in_ = st.columns(2)
                     with iy:
-                        if st.button("✔️ 確認匯入"):
+                        if st.button("✔️ 確認匯入", key="btn_confirm_menu_imp"):
                             source_items = settings["items"].get(source_proj, {}); target_items = settings["items"].get(global_project, {})
                             source_locs = settings["locations"].get(source_proj, {}); target_locs = settings["locations"].get(global_project, {})
                             for cat, items in source_items.items():
@@ -719,57 +715,9 @@ with tab_settings:
                                 if cat not in target_locs: target_locs[cat] = []
                                 for loc in locs:
                                     if loc not in target_locs[cat]: target_locs[cat].append(loc)
-                            save_settings(settings); st.success("匯入完成！"); st.session_state.import_confirm = False; time.sleep(1); st.rerun()
+                            save_settings(settings); st.success("選單匯入成功！"); st.session_state.menu_import_confirm = False; time.sleep(1); st.rerun()
                     with in_:
-                        if st.button("❌ 取消匯入"): st.session_state.import_confirm = False; st.rerun()
-            st.divider(); st.info(f"正在管理專案：{global_project}")
-            if "del_proj_confirm" not in st.session_state: st.session_state.del_proj_confirm = False
-            if not st.session_state.del_proj_confirm:
-                if st.button("🗑️ 刪除此專案"):
-                    if len(settings["projects"]) <= 1: st.error("這是最後一個專案，無法刪除！")
-                    else: st.session_state.del_proj_confirm = True; st.rerun()
-            else:
-                st.warning(f"⚠️ 確定要刪除「{global_project}」嗎？此動作無法復原！")
-                col_y, col_n = st.columns(2)
-                with col_y:
-                    if st.button("✔️ 是，刪除"):
-                        settings["projects"].remove(global_project)
-                        if global_project in settings["items"]: del settings["items"][global_project]
-                        if global_project in settings["locations"]: del settings["locations"][global_project]
-                        if global_project in settings["cat_config"]: del settings["cat_config"][global_project]
-                        if global_project in settings.get("item_details", {}): del settings["item_details"][global_project]
-                        save_settings(settings)
-                        if not df.empty: df = df[df['專案'] != global_project]; save_dataframe(df)
-                        st.session_state.del_proj_confirm = False; st.success("專案已刪除"); time.sleep(1); st.rerun()
-                with col_n:
-                    if st.button("❌ 否，取消"): st.session_state.del_proj_confirm = False; st.rerun()
-    st.divider(); st.markdown("### 二、大項管理")
-    with st.expander("0. 匯入其他專案選單 (覆蓋目前設定)", expanded=True):
-        st.info("此功能可將其他專案的選單（細項與地點）複製到目前專案。")
-        other_projects = [p for p in settings["projects"] if p != global_project]
-        if other_projects:
-            source_proj = st.selectbox("📥 選擇來源專案", other_projects)
-            if "menu_import_confirm" not in st.session_state: st.session_state.menu_import_confirm = False
-            if not st.session_state.menu_import_confirm:
-                if st.button("匯入選單"): st.session_state.menu_import_confirm = True; st.rerun()
-            else:
-                st.warning(f"⚠️ 確定要從【{source_proj}】複製選單到【{global_project}】嗎？這將合併現有項目。")
-                iy, in_ = st.columns(2)
-                with iy:
-                    if st.button("✔️ 確認匯入", key="btn_confirm_menu_imp"):
-                        source_items = settings["items"].get(source_proj, {}); target_items = settings["items"].get(global_project, {})
-                        source_locs = settings["locations"].get(source_proj, {}); target_locs = settings["locations"].get(global_project, {})
-                        for cat, items in source_items.items():
-                            if cat not in target_items: target_items[cat] = []
-                            for item in items:
-                                if item not in target_items[cat]: target_items[cat].append(item)
-                        for cat, locs in source_locs.items():
-                            if cat not in target_locs: target_locs[cat] = []
-                            for loc in locs:
-                                if loc not in target_locs[cat]: target_locs[cat].append(loc)
-                        save_settings(settings); st.success("選單匯入成功！"); st.session_state.menu_import_confirm = False; time.sleep(1); st.rerun()
-                with in_:
-                    if st.button("❌ 取消", key="btn_cancel_menu_imp"): st.session_state.menu_import_confirm = False; st.rerun()
+                        if st.button("❌ 取消", key="btn_cancel_menu_imp"): st.session_state.menu_import_confirm = False; st.rerun()
         else: st.warning("目前只有一個專案，無法執行匯入。")
     with st.expander("1. 增加紀錄項目", expanded=False):
         st.subheader("➕ 新增管理項目")
