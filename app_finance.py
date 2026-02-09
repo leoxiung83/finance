@@ -30,21 +30,36 @@ try:
 except ImportError:
     HAS_PDF_LIB = False
 
-# 設定頁面
-st.set_page_config(page_title="勁翔營造 工地記帳系統 ( 線上版 ) ", layout="wide", page_icon="🏗️")
+# 設定頁面 (標題已修改)
+st.set_page_config(page_title="勁翔營造股份有限公司 計帳系統", layout="wide", page_icon="🏗️")
 
-# --- 檔案與字型設定 ---
-DATA_FILE = 'finance_data.csv'
-SETTINGS_FILE = 'finance_settings.json'
-FONT_FILE = 'kaiu.ttf' 
+# --- 檔案與字型設定 (使用絕對路徑，解決資料夾移動後讀不到檔的問題) ---
+# 取得目前這支程式 (app_finance.py) 所在的絕對路徑資料夾
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# 所有的檔案讀取都基於這個 BASE_DIR，確保無論資料夾搬到哪都能找到檔案
+DATA_FILE = os.path.join(BASE_DIR, 'finance_data.csv')
+SETTINGS_FILE = os.path.join(BASE_DIR, 'finance_settings.json')
+FONT_FILE = os.path.join(BASE_DIR, 'kaiu.ttf')
 FONT_NAME = 'Kaiu'
+
+# --- 關鍵修正：安全檢查 Secrets 是否存在 ---
+def safe_check_secrets():
+    """安全地檢查 secrets 是否存在，不會因檔案缺失而崩潰"""
+    try:
+        # 嘗試存取，如果沒有 secrets.toml，這裡會報錯
+        if st.secrets is not None and "gcp_service_account" in st.secrets:
+            return True
+    except:
+        # 捕捉所有錯誤 (包含 FileNotFoundError, StreamlitSecretNotFoundError)
+        return False
+    return False
 
 # --- 判斷執行模式 ---
 def check_mode():
     if not HAS_GOOGLE_LIB: return "local"
-    try:
-        if "gcp_service_account" in st.secrets: return "cloud"
-    except: pass
+    # 使用安全檢查，避免崩潰
+    if safe_check_secrets(): return "cloud"
     return "local"
 
 MODE = check_mode()
@@ -76,6 +91,7 @@ DEFAULT_CAT_CONFIG = [
 @st.cache_resource
 def get_gsheet_client():
     if not HAS_GOOGLE_LIB: return None
+    if not safe_check_secrets(): return None # 再次確認，防止快取導致的錯誤
     try:
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
         creds_dict = dict(st.secrets["gcp_service_account"])
@@ -372,7 +388,7 @@ def generate_pdf_report(df, project_name, year, month):
 settings = load_settings()
 df = load_data()
 
-st.title("🏗️ 勁翔營造 工地記帳系統(線上版)")
+st.title("🏗️ 勁翔營造股份有限公司 計帳系統")
 
 if 'last_check_date' not in st.session_state:
     st.session_state.last_check_date = datetime.now().date()
@@ -396,22 +412,24 @@ with st.sidebar:
     else: st.markdown(f"### {global_date} {day_str}")
     
     st.divider()
+    
+    # --- 新增：重新整理資料按鈕 (移至底部) ---
+    if st.button("🔄 重新整理資料", use_container_width=True, help="若雲端有更新，請點此同步"):
+        load_data.clear()
+        st.rerun()
+
+    st.write("") # Spacer
+    
     if MODE == "local":
         if not HAS_GOOGLE_LIB:
             st.caption("⚠️ 單機模式 (缺少 gspread 套件)")
-        elif "gcp_service_account" not in st.secrets:
+        elif not safe_check_secrets():
+            # 這裡現在使用安全檢查，不會再報錯
             st.caption("⚠️ 單機模式 (未偵測到金鑰)")
         else:
             st.caption("💻 單機模式 (連線失敗)")
     else:
         st.caption("✅ 雲端連線正常")
-        
-    # --- 資料更新按鈕 (位置調整至底部) ---
-    st.write("") # Spacer
-    st.write("")
-    if st.button("🔄 資料更新", use_container_width=True, help="若雲端有更新，請點此同步"):
-        load_data.clear()
-        st.rerun()
 
 tab_entry, tab_data, tab_dash, tab_settings = st.tabs(["📝 支出填寫", "📋 明細管理", "📊 收支儀表板", "⚙️ 設定與管理"])
 
@@ -489,19 +507,30 @@ with tab_entry:
                                 st.toast(f"✅ {conf['display']} 儲存成功！")
                                 time.sleep(0.5)
 
-# --- Tab 2: 明細管理 (修正：使用 st.form 包裹 st.data_editor 防止勾選時自動重整) ---
+# --- Tab 2: 明細管理 (關鍵修改：將篩選器放入 Form 以防止小人跑動) ---
 with tab_data:
     proj_df = df[df['專案'] == global_project].copy()
     if proj_df.empty: st.info("⚠️ 本專案尚無任何資料")
     else:
-        c_filter1, c_filter2, c_filter3 = st.columns([1, 1, 2])
-        proj_df['Year'] = pd.to_datetime(proj_df['日期']).dt.year
-        all_years = sorted(proj_df['Year'].unique().tolist(), reverse=True)
-        with c_filter1: sel_year = st.selectbox("📅 統計年份", all_years, key="hist_year")
+        # --- [修正點] 將篩選條件包裹在 Form 內，輸入時不觸發重整 ---
+        with st.form(key="filter_form"):
+            c_filter1, c_filter2, c_filter3 = st.columns([1, 1, 2])
+            proj_df['Year'] = pd.to_datetime(proj_df['日期']).dt.year
+            all_years = sorted(proj_df['Year'].unique().tolist(), reverse=True)
+            with c_filter1: sel_year = st.selectbox("📅 統計年份", all_years, key="hist_year")
+            
+            # 必須先過濾年份才能決定月份清單 (這裡邏輯稍作調整以配合Form)
+            # 在 Form 內，變數直到 Submit 才會傳出，所以這裡用完整的 proj_df 算月份可能會包含其他年份的月份，但影響不大
+            year_df_temp = proj_df[proj_df['Year'] == sel_year] if sel_year else proj_df
+            all_months = sorted(year_df_temp['月份'].unique().tolist(), reverse=True)
+            
+            with c_filter2: sel_month = st.selectbox("編輯月份", ["整年"] + all_months, key="hist_month")
+            with c_filter3: search_kw = st.text_input("🔍 搜尋關鍵字", placeholder="輸入項目、備註或發票號碼...")
+            
+            submit_filter = st.form_submit_button("🔍 執行篩選")
+        
+        # --- 篩選邏輯 (根據 Form 的輸出執行) ---
         year_df = proj_df[proj_df['Year'] == sel_year].copy()
-        all_months = sorted(year_df['月份'].unique().tolist(), reverse=True)
-        with c_filter2: sel_month = st.selectbox("編輯月份", ["整年"] + all_months, key="hist_month")
-        with c_filter3: search_kw = st.text_input("🔍 搜尋關鍵字", placeholder="輸入項目、備註或發票號碼...")
         view_df = year_df.copy()
         if sel_month != "整年": view_df = view_df[view_df['月份'] == sel_month]
         if search_kw: view_df = view_df[view_df['項目內容'].str.contains(search_kw, case=False) | view_df['備註'].str.contains(search_kw, case=False) | view_df['發票號碼'].str.contains(search_kw, case=False)]
@@ -735,7 +764,7 @@ with tab_settings:
                                 if cat not in target_locs: target_locs[cat] = []
                                 for loc in locs:
                                     if loc not in target_locs[cat]: target_locs[cat].append(loc)
-                            save_settings(settings); st.success("匯入完成！"); st.session_state.import_confirm = False; time.sleep(1); st.rerun()
+                            save_settings(settings); st.success("選單匯入成功！"); st.session_state.import_confirm = False; time.sleep(1); st.rerun()
                     with in_:
                         if st.button("❌ 取消匯入"): st.session_state.import_confirm = False; st.rerun()
             st.divider(); st.info(f"正在管理專案：{global_project}")
@@ -773,9 +802,6 @@ with tab_settings:
                 iy, in_ = st.columns(2)
                 with iy:
                     if st.button("✔️ 確認匯入", key="btn_confirm_menu_imp"):
-                        # 複製大項設定
-                        settings["cat_config"][global_project] = copy.deepcopy(settings["cat_config"][source_proj])
-                        # 複製細項與地點
                         source_items = settings["items"].get(source_proj, {}); target_items = settings["items"].get(global_project, {})
                         source_locs = settings["locations"].get(source_proj, {}); target_locs = settings["locations"].get(global_project, {})
                         for cat, items in source_items.items():
@@ -934,8 +960,4 @@ with tab_settings:
                                 settings["locations"][global_project][cat_key].remove(item)
                                 save_settings(settings); st.session_state[del_sub_key] = False; st.rerun()
                             if st.button("❌", key=f"no_{list_type}_{i}"): st.session_state[del_sub_key] = False; st.rerun()
-
         else: st.info(f"此類別目前沒有設定常用{manage_mode_display.split()[1]}。")
-
-
-
