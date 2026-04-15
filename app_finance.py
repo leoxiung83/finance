@@ -275,8 +275,8 @@ def get_date_info(date_obj):
     if is_weekend: return f"🔴 {w_str}", True 
     return f"{w_str}", False
 
-# --- PDF 生成 ---
-def generate_pdf_report(df, project_name, year, month):
+# --- PDF 生成 (新增 prev_balance 參數以計算正確本期結餘) ---
+def generate_pdf_report(df, project_name, year, month, prev_balance=0):
     if not HAS_PDF_LIB:
         st.error("系統缺少 'reportlab' 套件。")
         return None
@@ -318,13 +318,30 @@ def generate_pdf_report(df, project_name, year, month):
     elements.append(t_info)
     elements.append(HRFlowable(width="100%", thickness=2, color=accent_color, spaceBefore=5, spaceAfter=15))
 
+    # ===== 修改處：加入前期結餘欄位 =====
     elements.append(Paragraph("一、財務總覽", style_h2))
     rpt_inc = df[df['類別'] == '入帳金額']['總價'].sum()
     rpt_exp = df[df['類別'] != '入帳金額']['總價'].sum()
-    rpt_bal = rpt_inc - rpt_exp
-    data_summary = [['項目', '總入帳', '總支出', '目前結餘'], ['金額', f"${rpt_inc:,.0f}", f"${rpt_exp:,.0f}", f"${rpt_bal:,.0f}"]]
-    t_sum = Table(data_summary, colWidths=[120, 180, 180, 180], hAlign='LEFT')
-    t_sum.setStyle(TableStyle([('FONTNAME', (0,0), (-1,-1), font_main), ('FONTSIZE', (0,0), (-1,-1), 12), ('LEADING', (0,0), (-1,-1), 18), ('BACKGROUND', (0,0), (-1,0), accent_color), ('TEXTCOLOR', (0,0), (-1,0), header_text_color), ('FONTNAME', (0,0), (-1,0), font_bold), ('ALIGN', (0,0), (-1,0), 'CENTER'), ('ALIGN', (1,1), (-1,1), 'RIGHT'), ('BACKGROUND', (0,1), (-1,1), summary_bg), ('GRID', (0,0), (-1,-1), 1, colors.grey), ('TEXTCOLOR', (3,1), (3,1), colors.red if rpt_bal < 0 else accent_color), ('FONTNAME', (3,1), (3,1), font_bold)]))
+    # 本期結餘 = 前期結餘 + 本期入帳 - 本期支出
+    rpt_bal = prev_balance + rpt_inc - rpt_exp 
+    
+    data_summary = [['項目', '前期結餘', '本期入帳', '本期支出', '本期結餘'], 
+                    ['金額', f"${prev_balance:,.0f}", f"${rpt_inc:,.0f}", f"${rpt_exp:,.0f}", f"${rpt_bal:,.0f}"]]
+    t_sum = Table(data_summary, colWidths=[100, 140, 140, 140, 140], hAlign='LEFT')
+    t_sum.setStyle(TableStyle([
+        ('FONTNAME', (0,0), (-1,-1), font_main), 
+        ('FONTSIZE', (0,0), (-1,-1), 12), 
+        ('LEADING', (0,0), (-1,-1), 18), 
+        ('BACKGROUND', (0,0), (-1,0), accent_color), 
+        ('TEXTCOLOR', (0,0), (-1,0), header_text_color), 
+        ('FONTNAME', (0,0), (-1,0), font_bold), 
+        ('ALIGN', (0,0), (-1,0), 'CENTER'), 
+        ('ALIGN', (1,1), (-1,1), 'RIGHT'), 
+        ('BACKGROUND', (0,1), (-1,1), summary_bg), 
+        ('GRID', (0,0), (-1,-1), 1, colors.grey), 
+        ('TEXTCOLOR', (4,1), (4,1), colors.red if rpt_bal < 0 else accent_color), 
+        ('FONTNAME', (4,1), (4,1), font_bold)
+    ]))
     elements.append(t_sum)
     elements.append(Spacer(1, 25))
     
@@ -347,7 +364,6 @@ def generate_pdf_report(df, project_name, year, month):
     headers = ['日期', '星期', '項目內容', '單位', '數量', '單價', '總價', '地點', '經手', '憑證', '發票', '備註']
     weekdays_list = ["(週一)", "(週二)", "(週三)", "(週四)", "(週五)", "(週六)", "(週日)"]
     for cat in cat_order:
-        # ===== 修改處：報表內相關顯示日期排序請由日期少的開始 (ascending=True) =====
         cat_df = df[df['類別'] == cat].sort_values('日期', ascending=True).copy()
         if cat_df.empty: continue
         subtotal = cat_df['總價'].sum()
@@ -610,13 +626,15 @@ with tab_dash:
     if not dash_df.empty:
         dash_df['總價'] = pd.to_numeric(dash_df['總價'], errors='coerce').fillna(0)
         
-        # ===== 修改處：新增年份與月份篩選器 =====
         col_dash_y, col_dash_m = st.columns(2)
         dash_years = sorted(dash_df['Year'].unique().tolist(), reverse=True)
         
         with col_dash_y:
             dash_sel_year = st.selectbox("📊 概況年份", ["全部年度"] + dash_years, key="dash_filter_y")
             
+        # ===== 修改處：計算前期結餘 =====
+        prev_balance = 0 # 預設全部年度沒有「前期」
+        
         if dash_sel_year == "全部年度":
             filter_dash_df = dash_df.copy()
             dash_title = "全部年度"
@@ -629,17 +647,37 @@ with tab_dash:
             if dash_sel_month == "整年份":
                 filter_dash_df = dash_year_df.copy()
                 dash_title = f"{dash_sel_year}年"
+                # 計算：該年之前的歷史加總
+                past_df = dash_df[dash_df['Year'] < dash_sel_year]
+                if not past_df.empty:
+                    prev_balance = past_df[past_df['類別'] == '入帳金額']['總價'].sum() - past_df[past_df['類別'] != '入帳金額']['總價'].sum()
             else:
                 filter_dash_df = dash_year_df[dash_year_df['月份'] == dash_sel_month].copy()
                 dash_title = f"{dash_sel_month}"
+                # 計算：該月之前的歷史加總
+                past_df = dash_df[dash_df['月份'] < dash_sel_month]
+                if not past_df.empty:
+                    prev_balance = past_df[past_df['類別'] == '入帳金額']['總價'].sum() - past_df[past_df['類別'] != '入帳金額']['總價'].sum()
         
-        # 使用篩選後的 filter_dash_df 來計算
-        income_df = filter_dash_df[filter_dash_df['類別'] == '入帳金額']; expense_df = filter_dash_df[filter_dash_df['類別'] != '入帳金額']
-        in_total = income_df['總價'].sum(); out_total = expense_df['總價'].sum()
+        # 使用篩選後的 filter_dash_df 來計算本期金額
+        income_df = filter_dash_df[filter_dash_df['類別'] == '入帳金額']
+        expense_df = filter_dash_df[filter_dash_df['類別'] != '入帳金額']
+        in_total = income_df['總價'].sum()
+        out_total = expense_df['總價'].sum()
+        
+        # 本期結餘 = 前期結餘 + 本期入帳 - 本期支出
+        current_balance = prev_balance + in_total - out_total
         
         st.markdown(f"### 📊 {dash_title} 財務概況")
-        i1, i2 = st.columns(2); i1.metric("專案總入帳", f"${in_total:,.0f}"); i2.metric("專案總支出", f"${out_total:,.0f}")
-        st.divider(); st.metric("💰 專案目前結餘", f"${in_total - out_total:,.0f}")
+        
+        # ===== 修改處：顯示前期結餘 =====
+        i1, i2, i3 = st.columns(3)
+        i1.metric("前期結餘", f"${prev_balance:,.0f}")
+        i2.metric("本期入帳", f"${in_total:,.0f}")
+        i3.metric("本期支出", f"${out_total:,.0f}")
+        
+        st.divider()
+        st.metric("💰 專案目前結餘", f"${current_balance:,.0f}")
         
         st.divider()
         st.subheader("支出結構分析")
@@ -678,10 +716,23 @@ with tab_dash:
         rpt_data_y = dash_df[dash_df['Year'] == rpt_sel_year]
         rpt_months = sorted(rpt_data_y['月份'].unique().tolist(), reverse=True)
         with c_rpt_m: rpt_sel_month = st.selectbox("報表月份", ["整年度"] + rpt_months, key="rpt_m")
+        
         if st.button("📥 下載 PDF 報表"):
             rpt_df = rpt_data_y.copy()
-            if rpt_sel_month != "整年度": rpt_df = rpt_df[rpt_df['月份'] == rpt_sel_month]
-            pdf_data = generate_pdf_report(rpt_df, global_project, rpt_sel_year, rpt_sel_month)
+            rpt_prev_balance = 0
+            
+            # ===== 修改處：計算報表所需的前期結餘 =====
+            if rpt_sel_month != "整年度":
+                rpt_df = rpt_df[rpt_df['月份'] == rpt_sel_month]
+                rpt_past_df = dash_df[dash_df['月份'] < rpt_sel_month]
+            else:
+                rpt_past_df = dash_df[dash_df['Year'] < rpt_sel_year]
+                
+            if not rpt_past_df.empty:
+                rpt_prev_balance = rpt_past_df[rpt_past_df['類別'] == '入帳金額']['總價'].sum() - rpt_past_df[rpt_past_df['類別'] != '入帳金額']['總價'].sum()
+            
+            # 將前期結餘傳入 PDF 生成函數
+            pdf_data = generate_pdf_report(rpt_df, global_project, rpt_sel_year, rpt_sel_month, rpt_prev_balance)
             if pdf_data:
                 file_name = f"財務報表_{global_project}_{rpt_sel_year}_{rpt_sel_month}.pdf"
                 st.download_button("📥 點此下載 PDF", data=pdf_data, file_name=file_name, mime="application/pdf")
