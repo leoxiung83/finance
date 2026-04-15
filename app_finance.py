@@ -30,29 +30,21 @@ try:
 except ImportError:
     HAS_PDF_LIB = False
 
-# 設定頁面 (標題已修改)
-st.set_page_config(page_title="勁翔營造工地記帳系統", layout="wide", page_icon="🏗️")
+# 設定頁面
+st.set_page_config(page_title="勁翔營造 工地計帳系統", layout="wide", page_icon="🏗️")
 
-# --- 檔案與字型設定 (使用絕對路徑) ---
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_FILE = os.path.join(BASE_DIR, 'finance_data.csv')
-SETTINGS_FILE = os.path.join(BASE_DIR, 'finance_settings.json')
-FONT_FILE = os.path.join(BASE_DIR, 'kaiu.ttf')
+# --- 檔案與字型設定 ---
+DATA_FILE = 'finance_data.csv'
+SETTINGS_FILE = 'finance_settings.json'
+FONT_FILE = 'kaiu.ttf' 
 FONT_NAME = 'Kaiu'
-
-# --- 關鍵修正：安全檢查 Secrets 是否存在 ---
-def safe_check_secrets():
-    try:
-        if st.secrets is not None and "gcp_service_account" in st.secrets:
-            return True
-    except:
-        return False
-    return False
 
 # --- 判斷執行模式 ---
 def check_mode():
     if not HAS_GOOGLE_LIB: return "local"
-    if safe_check_secrets(): return "cloud"
+    try:
+        if "gcp_service_account" in st.secrets: return "cloud"
+    except: pass
     return "local"
 
 MODE = check_mode()
@@ -84,7 +76,6 @@ DEFAULT_CAT_CONFIG = [
 @st.cache_resource
 def get_gsheet_client():
     if not HAS_GOOGLE_LIB: return None
-    if not safe_check_secrets(): return None 
     try:
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
         creds_dict = dict(st.secrets["gcp_service_account"])
@@ -106,6 +97,7 @@ def load_data():
                 df = pd.DataFrame(data) if data else pd.DataFrame(columns=cols)
                 for c in cols:
                     if c not in df.columns: df[c] = ""
+                # 格式化
                 text_cols = ['發票號碼', '備註', '購買地點', '經手人', '項目內容', '專案', '類別', '單位', '憑證類型']
                 for col in text_cols:
                     if col in df.columns: df[col] = df[col].fillna("").astype(str)
@@ -117,6 +109,7 @@ def load_data():
         except:
             pass 
             
+    # Local Mode
     if os.path.exists(DATA_FILE):
         try:
             df = pd.read_csv(DATA_FILE)
@@ -161,7 +154,7 @@ def load_settings():
         "projects": ["預設專案"],
         "items": {"預設專案": {c["key"]: [] for c in DEFAULT_CAT_CONFIG}},
         "locations": {"預設專案": {c["key"]: [] for c in DEFAULT_CAT_CONFIG}},
-        "cat_config": DEFAULT_CAT_CONFIG, 
+        "cat_config": DEFAULT_CAT_CONFIG, # 舊格式可能長這樣
         "item_details": {}
     }
     settings = default
@@ -178,17 +171,25 @@ def load_settings():
             with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
                 settings = json.load(f)
     
+    # --- 關鍵修正：結構自動遷移邏輯 ---
+    # 1. 確保 projects 存在
     if "projects" not in settings: settings["projects"] = ["預設專案"]
+    
+    # 2. 檢測 cat_config 是否為舊版 List 格式，如果是，轉為新版 Dict 格式
     if isinstance(settings.get("cat_config"), list):
         old_config_list = settings["cat_config"]
-        settings["cat_config"] = {}
+        settings["cat_config"] = {} # 重置為字典
         for p in settings["projects"]:
             settings["cat_config"][p] = copy.deepcopy(old_config_list)
+            
+    # 3. 確保每個專案都有獨立的 cat_config
     if isinstance(settings.get("cat_config"), dict):
         for p in settings["projects"]:
             if p not in settings["cat_config"]:
+                # 如果某個專案沒有設定，給它預設值
                 settings["cat_config"][p] = copy.deepcopy(DEFAULT_CAT_CONFIG)
     else:
+        # 如果 cat_config 既不是 list 也不是 dict (異常情況)，重置
         settings["cat_config"] = {}
         for p in settings["projects"]:
             settings["cat_config"][p] = copy.deepcopy(DEFAULT_CAT_CONFIG)
@@ -240,17 +241,20 @@ def create_zip_backup(target_project=None):
     with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
         if target_project and target_project != "所有專案" and target_project != "所有專案 (完整系統)":
             df_out = df_latest[df_latest['專案'] == target_project] if not df_latest.empty else df_latest
+            
+            # 備份單一專案時，將該專案的設定轉為通用格式，方便還原
             proj_conf = settings_latest.get("cat_config", {}).get(target_project, DEFAULT_CAT_CONFIG)
+            
             s_out = {
                 "projects": [target_project],
-                "cat_config": proj_conf, 
+                "cat_config": proj_conf, # 這裡存成 List，讓還原邏輯能識別
                 "items": {target_project: settings_latest.get("items", {}).get(target_project, {})},
                 "locations": {target_project: settings_latest.get("locations", {}).get(target_project, {})},
                 "item_details": {target_project: settings_latest.get("item_details", {}).get(target_project, {})}
             }
         else:
             df_out = df_latest
-            s_out = settings_latest
+            s_out = settings_latest # 完整備份直接存 Dict 結構
         
         csv_buffer = io.StringIO()
         df_out.to_csv(csv_buffer, index=False, encoding='utf-8-sig')
@@ -343,7 +347,8 @@ def generate_pdf_report(df, project_name, year, month):
     headers = ['日期', '星期', '項目內容', '單位', '數量', '單價', '總價', '地點', '經手', '憑證', '發票', '備註']
     weekdays_list = ["(週一)", "(週二)", "(週三)", "(週四)", "(週五)", "(週六)", "(週日)"]
     for cat in cat_order:
-        cat_df = df[df['類別'] == cat].sort_values('日期', ascending=False).copy()
+        # ===== 修改處：報表內相關顯示日期排序請由日期少的開始 (ascending=True) =====
+        cat_df = df[df['類別'] == cat].sort_values('日期', ascending=True).copy()
         if cat_df.empty: continue
         subtotal = cat_df['總價'].sum()
         elements.append(Paragraph(f"{cat} (小計: ${subtotal:,.0f})", style_h3))
@@ -361,48 +366,6 @@ def generate_pdf_report(df, project_name, year, month):
     buffer.seek(0)
     return buffer
 
-# --- [新增功能] 刪除確認視窗 (使用 st.dialog 防止小人跑動) ---
-@st.dialog("⚠️ 確認刪除資料")
-def show_delete_confirmation(edited_cat_snapshot, global_proj, conf_key, sel_y, sel_m):
-    # 計算出原本要被刪除的資料
-    rows_to_del = edited_cat_snapshot[edited_cat_snapshot['刪除'] == True]
-    st.warning(f"您即將永久刪除 {len(rows_to_del)} 筆資料，此動作無法復原。")
-    st.write("確定要繼續嗎？")
-    
-    col_y, col_n = st.columns(2)
-    
-    if col_y.button("✔️ 是，刪除", type="primary", key="dialog_confirm_del"):
-        with st.spinner("處理中..."):
-            # 重新讀取最新的完整資料，避免版本衝突
-            current_full_df = load_data()
-            
-            # 建構篩選邏輯，找出屬於當前檢視範圍的資料 (專案+類別+年份+月份)
-            mask = (current_full_df['專案'] == global_proj) & (current_full_df['類別'] == conf_key) & (current_full_df['Year'] == sel_y)
-            if sel_m != "整年":
-                mask = mask & (current_full_df['月份'] == sel_m)
-            
-            # 從編輯過的快照中，保留「刪除=False」的資料
-            rows_keep = edited_cat_snapshot[edited_cat_snapshot['刪除'] == False].copy()
-            
-            # 整理要寫回的資料結構
-            df_kept_outside = current_full_df[~mask] # 原本就不在這次編輯範圍內的資料(保留)
-            
-            # 整理這次編輯後的資料 (要寫入的)
-            df_add = rows_keep.drop(columns=['刪除', '星期/節日'], errors='ignore')
-            df_add['類別'] = conf_key
-            df_add['專案'] = global_proj
-            # 重算總價以防萬一
-            df_add['總價'] = pd.to_numeric(df_add['數量'], errors='coerce') * pd.to_numeric(df_add['單價'], errors='coerce')
-            
-            # 合併並存檔
-            if save_dataframe(pd.concat([df_kept_outside, df_add], ignore_index=True)):
-                st.success("已刪除！")
-                time.sleep(0.5)
-                st.rerun() # 這裡的 rerun 會關閉視窗並刷新主頁面
-                
-    if col_n.button("❌ 否，取消", key="dialog_cancel_del"):
-        st.rerun() # 這裡的 rerun 會單純關閉視窗，不執行任何動作
-
 # ==========================================
 # 3. UI 介面
 # ==========================================
@@ -410,7 +373,7 @@ def show_delete_confirmation(edited_cat_snapshot, global_proj, conf_key, sel_y, 
 settings = load_settings()
 df = load_data()
 
-st.title("🏗️ 勁翔營造工地記帳系統")
+st.title("🏗️ 勁翔營造 工地計帳系統")
 
 if 'last_check_date' not in st.session_state:
     st.session_state.last_check_date = datetime.now().date()
@@ -434,18 +397,18 @@ with st.sidebar:
     else: st.markdown(f"### {global_date} {day_str}")
     
     st.divider()
-    
     if MODE == "local":
         if not HAS_GOOGLE_LIB:
             st.caption("⚠️ 單機模式 (缺少 gspread 套件)")
-        elif not safe_check_secrets():
+        elif "gcp_service_account" not in st.secrets:
             st.caption("⚠️ 單機模式 (未偵測到金鑰)")
         else:
             st.caption("💻 單機模式 (連線失敗)")
     else:
         st.caption("✅ 雲端連線正常")
         
-    st.write("") 
+    # --- 資料更新按鈕 (位置調整至底部) ---
+    st.write("") # Spacer
     st.write("")
     if st.button("🔄 資料更新", use_container_width=True, help="若雲端有更新，請點此同步"):
         load_data.clear()
@@ -453,35 +416,45 @@ with st.sidebar:
 
 tab_entry, tab_data, tab_dash, tab_settings = st.tabs(["📝 支出填寫", "📋 明細管理", "📊 收支儀表板", "⚙️ 設定與管理"])
 
+# 取得目前專案的獨立設定
 current_cat_config = settings["cat_config"][global_project]
 
-# --- Tab 1: 支出填寫 ---
+# --- Tab 1: 支出填寫 (優化版：選單與手動輸入並存，不自動重整) ---
 with tab_entry:
     st.info(f"📍 當前專案：{global_project} | 日期：{global_date} {day_str}")
     
-    for conf in current_cat_config: 
+    for conf in current_cat_config: # 使用專案獨立設定
         icon = "💰" if conf["type"] == "income" else "💸"
+        
+        # 使用 Form 來防止輸入時的頁面重整 (Running Man)
         with st.expander(f"{icon} {conf['display']}", expanded=False):
             with st.form(key=f"form_entry_{conf['key']}"):
                 col1, col2 = st.columns(2)
+                
+                # 準備選單內容
                 items_list = settings["items"].get(global_project, {}).get(conf["key"], [])
                 
                 if conf["type"] == "income":
                     with col1:
+                        # 兩個欄位並存：選單 與 手動輸入
                         sel = st.selectbox("入帳來源 (選單)", ["(請選擇)"] + items_list)
                         man_val = st.text_input("或手動輸入來源 (若填寫則優先使用此欄位)")
                         price = st.number_input("入帳金額", min_value=0, step=100)
                     with col2:
                         buyer = st.text_input("收帳人 (經手人)")
                         note = st.text_area("備註", height=100)
+                    # 隱藏預設值
                     sel_loc = ""; man_loc = ""; r_type = "無"; inv_no = ""; qty = 1; unit = "次"
                 else:
                     with col1:
+                        # 兩個欄位並存
                         sel = st.selectbox("項目內容 (選單)", ["(請選擇)"] + items_list)
                         man_val = st.text_input("或手動輸入項目 (若填寫則優先使用此欄位)")
+                        
                         locs_list = settings["locations"].get(global_project, {}).get(conf["key"], [])
                         sel_loc = st.selectbox("購買地點 (選單)", ["(請選擇)"] + locs_list)
                         man_loc = st.text_input("或手動輸入地點")
+                        
                         buyer = st.text_input("購買人 (經手人)")
                     with col2:
                         r_type = st.radio("憑證類型", ["收據", "發票"], horizontal=True)
@@ -492,11 +465,17 @@ with tab_entry:
                         price = st.number_input("單價/金額", min_value=0, step=1)
                     note = st.text_input("備註")
 
+                # 送出按鈕 (此時才會連線運算)
                 submitted = st.form_submit_button("💾 儲存紀錄")
                 
                 if submitted:
+                    # 邏輯判斷：如果有手動輸入，就用手動的；否則用選單的
                     final_item = man_val if man_val.strip() else (sel if sel != "(請選擇)" else "")
-                    final_loc = man_loc if man_loc.strip() else (sel_loc if sel_loc != "(請選擇)" else "")
+                    
+                    if conf["type"] != "income":
+                        final_loc = man_loc if man_loc.strip() else (sel_loc if sel_loc != "(請選擇)" else "")
+                    else:
+                        final_loc = ""
                     
                     if not final_item:
                         st.error("❌ 請輸入或選擇項目名稱！")
@@ -511,26 +490,19 @@ with tab_entry:
                                 st.toast(f"✅ {conf['display']} 儲存成功！")
                                 time.sleep(0.5)
 
-# --- Tab 2: 明細管理 (關鍵修改：使用 st.dialog 取代原有刪除流程) ---
+# --- Tab 2: 明細管理 (修正：使用 st.form 包裹 st.data_editor 防止勾選時自動重整) ---
 with tab_data:
     proj_df = df[df['專案'] == global_project].copy()
     if proj_df.empty: st.info("⚠️ 本專案尚無任何資料")
     else:
-        with st.form(key="filter_form"):
-            c_filter1, c_filter2, c_filter3 = st.columns([1, 1, 2])
-            proj_df['Year'] = pd.to_datetime(proj_df['日期']).dt.year
-            all_years = sorted(proj_df['Year'].unique().tolist(), reverse=True)
-            with c_filter1: sel_year = st.selectbox("📅 統計年份", all_years, key="hist_year")
-            
-            year_df_temp = proj_df[proj_df['Year'] == sel_year] if sel_year else proj_df
-            all_months = sorted(year_df_temp['月份'].unique().tolist(), reverse=True)
-            
-            with c_filter2: sel_month = st.selectbox("編輯月份", ["整年"] + all_months, key="hist_month")
-            with c_filter3: search_kw = st.text_input("🔍 搜尋關鍵字", placeholder="輸入項目、備註或發票號碼...")
-            
-            submit_filter = st.form_submit_button("🔍 執行篩選")
-        
+        c_filter1, c_filter2, c_filter3 = st.columns([1, 1, 2])
+        proj_df['Year'] = pd.to_datetime(proj_df['日期']).dt.year
+        all_years = sorted(proj_df['Year'].unique().tolist(), reverse=True)
+        with c_filter1: sel_year = st.selectbox("📅 統計年份", all_years, key="hist_year")
         year_df = proj_df[proj_df['Year'] == sel_year].copy()
+        all_months = sorted(year_df['月份'].unique().tolist(), reverse=True)
+        with c_filter2: sel_month = st.selectbox("編輯月份", ["整年"] + all_months, key="hist_month")
+        with c_filter3: search_kw = st.text_input("🔍 搜尋關鍵字", placeholder="輸入項目、備註或發票號碼...")
         view_df = year_df.copy()
         if sel_month != "整年": view_df = view_df[view_df['月份'] == sel_month]
         if search_kw: view_df = view_df[view_df['項目內容'].str.contains(search_kw, case=False) | view_df['備註'].str.contains(search_kw, case=False) | view_df['發票號碼'].str.contains(search_kw, case=False)]
@@ -538,7 +510,7 @@ with tab_data:
         st.divider()
         if view_df.empty: st.warning("查無符合條件的資料")
         else:
-            for conf in current_cat_config: 
+            for conf in current_cat_config: # 使用專案獨立設定
                 cat_df = view_df[view_df['類別'] == conf['key']].copy()
                 cat_df['總價'] = pd.to_numeric(cat_df['總價'], errors='coerce').fillna(0)
                 subtotal = cat_df['總價'].sum()
@@ -557,17 +529,19 @@ with tab_data:
                     else:
                         col_config = {"刪除": st.column_config.CheckboxColumn(width="small"), "總價": st.column_config.NumberColumn(format="$%d", disabled=True), "日期": st.column_config.DateColumn(format="YYYY-MM-DD", width="small"), "星期/節日": st.column_config.TextColumn(disabled=True, width="small")}
                     
-                    # --- 表格與按鈕區 (Form) ---
+                    # --- 使用 FORM 包裹表格與按鈕，解決勾選時小人跑動問題 ---
                     with st.form(key=f"form_editor_{conf['key']}"):
+                        # 關鍵修正：加入 hide_index=True 並重置索引
                         edited_cat = st.data_editor(cat_df.sort_values('日期', ascending=False).reset_index(drop=True), column_config=col_config, use_container_width=True, num_rows="dynamic", key=f"editor_{conf['key']}_{sel_year}_{sel_month}", hide_index=True)
                         
                         c_btn1, c_btn2, _ = st.columns([1, 1, 4])
+                        # 使用 form_submit_button
                         with c_btn1:
                             submit_update = st.form_submit_button("💾 更新修改")
                         with c_btn2:
                             submit_delete = st.form_submit_button("🗑️ 刪除選取")
                     
-                    # --- 邏輯處理區 ---
+                    # --- 處理按鈕邏輯 (在 Form 外部處理) ---
                     if submit_update:
                         if search_kw: st.error("搜尋模式下無法存檔！")
                         else:
@@ -584,16 +558,50 @@ with tab_data:
                                 df_add = final_df.drop(columns=['刪除', '星期/節日'], errors='ignore')
                                 if save_dataframe(pd.concat([df_kept, df_add], ignore_index=True)): st.success("更新成功！"); time.sleep(1); st.rerun()
 
-                    # --- 刪除按鈕 (改用 Dialog 觸發，不使用 Session State 造成的小人跑動) ---
+                    # --- 刪除按鈕邏輯 (檢查勾選並設定 Session State) ---
                     if submit_delete:
                         if not edited_cat['刪除'].any():
                             st.warning("請先勾選要刪除的項目")
                         elif search_kw:
                             st.error("搜尋模式下無法執行刪除")
                         else:
-                            # 直接呼叫懸浮視窗，傳入當前的資料狀態
-                            show_delete_confirmation(edited_cat, global_project, conf['key'], sel_year, sel_month)
+                            # 將要刪除的資料暫存到 Session State，並開啟確認模式
+                            st.session_state[f"pending_del_df_{conf['key']}"] = edited_cat
+                            st.session_state[f"confirm_del_{conf['key']}"] = True
+                            st.rerun() # 強制重整以顯示下方的確認框
                     
+                    # --- 顯示確認警告 (在 Form 外部顯示) ---
+                    if st.session_state.get(f"confirm_del_{conf['key']}"):
+                        st.warning("⚠️ 確定要永久刪除勾選的資料嗎？")
+                        col_yes, col_no = st.columns(2)
+                        
+                        if col_yes.button("✔️ 是，刪除", key=f"yes_{conf['key']}"):
+                            # 從 Session State 取回暫存的資料表
+                            pending_df = st.session_state.get(f"pending_del_df_{conf['key']}")
+                            if pending_df is not None:
+                                with st.spinner("正在刪除..."):
+                                    rows_keep = pending_df[pending_df['刪除'] == False].copy()
+                                    current_full_df = df
+                                    mask = (current_full_df['專案'] == global_project) & (current_full_df['類別'] == conf['key']) & (current_full_df['Year'] == sel_year)
+                                    if sel_month != "整年": mask = mask & (current_full_df['月份'] == sel_month)
+                                    df_kept = current_full_df[~mask]
+                                    df_add = rows_keep.drop(columns=['刪除', '星期/節日'], errors='ignore')
+                                    df_add['類別'] = conf['key']; df_add['專案'] = global_project
+                                    df_add['總價'] = pd.to_numeric(df_add['數量'], errors='coerce') * pd.to_numeric(df_add['單價'], errors='coerce')
+                                    
+                                    if save_dataframe(pd.concat([df_kept, df_add], ignore_index=True)):
+                                        st.success("已刪除"); 
+                                        # 清除狀態
+                                        st.session_state[f"confirm_del_{conf['key']}"] = False
+                                        del st.session_state[f"pending_del_df_{conf['key']}"]
+                                        time.sleep(1); st.rerun()
+                                        
+                        if col_no.button("❌ 否，取消", key=f"no_{conf['key']}"):
+                            st.session_state[f"confirm_del_{conf['key']}"] = False
+                            if f"pending_del_df_{conf['key']}" in st.session_state:
+                                del st.session_state[f"pending_del_df_{conf['key']}"]
+                            st.rerun()
+                            
                     st.markdown("---")
 
 # --- Tab 3: 收支儀表板 (含分類統計表 & 正確類別名稱顯示) ---
@@ -601,11 +609,35 @@ with tab_dash:
     dash_df = df[df['專案'] == global_project].copy()
     if not dash_df.empty:
         dash_df['總價'] = pd.to_numeric(dash_df['總價'], errors='coerce').fillna(0)
-        today_str = datetime.now().date(); cur_year = today_str.year
-        income_df = dash_df[dash_df['類別'] == '入帳金額']; expense_df = dash_df[dash_df['類別'] != '入帳金額']
+        
+        # ===== 修改處：新增年份與月份篩選器 =====
+        col_dash_y, col_dash_m = st.columns(2)
+        dash_years = sorted(dash_df['Year'].unique().tolist(), reverse=True)
+        
+        with col_dash_y:
+            dash_sel_year = st.selectbox("📊 概況年份", ["全部年度"] + dash_years, key="dash_filter_y")
+            
+        if dash_sel_year == "全部年度":
+            filter_dash_df = dash_df.copy()
+            dash_title = "全部年度"
+        else:
+            dash_year_df = dash_df[dash_df['Year'] == dash_sel_year]
+            dash_months = sorted(dash_year_df['月份'].unique().tolist(), reverse=True)
+            with col_dash_m:
+                dash_sel_month = st.selectbox("📊 概況月份", ["整年份"] + dash_months, key="dash_filter_m")
+                
+            if dash_sel_month == "整年份":
+                filter_dash_df = dash_year_df.copy()
+                dash_title = f"{dash_sel_year}年"
+            else:
+                filter_dash_df = dash_year_df[dash_year_df['月份'] == dash_sel_month].copy()
+                dash_title = f"{dash_sel_month}"
+        
+        # 使用篩選後的 filter_dash_df 來計算
+        income_df = filter_dash_df[filter_dash_df['類別'] == '入帳金額']; expense_df = filter_dash_df[filter_dash_df['類別'] != '入帳金額']
         in_total = income_df['總價'].sum(); out_total = expense_df['總價'].sum()
         
-        st.markdown(f"### 📊 {cur_year}年 財務概況")
+        st.markdown(f"### 📊 {dash_title} 財務概況")
         i1, i2 = st.columns(2); i1.metric("專案總入帳", f"${in_total:,.0f}"); i2.metric("專案總支出", f"${out_total:,.0f}")
         st.divider(); st.metric("💰 專案目前結餘", f"${in_total - out_total:,.0f}")
         
@@ -613,18 +645,29 @@ with tab_dash:
         st.subheader("支出結構分析")
         col_chart, col_table = st.columns([1.5, 1])
         
+        # 1. 圓餅圖
+        # 建立映射字典：key -> display name (使用專案獨立的設定)
         cat_map = {c['key']: c['display'] for c in current_cat_config}
+        
+        # 統計
         chart_df = expense_df.groupby('類別')['總價'].sum().reset_index()
+        
+        # 將 Key 替換為 Display Name
         chart_df['類別'] = chart_df['類別'].map(cat_map).fillna(chart_df['類別'])
         
         if not chart_df.empty:
             c = alt.Chart(chart_df).mark_arc(innerRadius=50).encode(theta=alt.Theta("總價", stack=True), color=alt.Color("類別", title="類別"), tooltip=["類別", "總價"])
             with col_chart: st.altair_chart(c, use_container_width=True)
             
+            # 2. 分類統計表 (呈現詳細數據)
             chart_df['佔比'] = (chart_df['總價'] / out_total * 100).map('{:.1f}%'.format)
+            # 格式化金額
             chart_df['金額'] = chart_df['總價'].map('${:,.0f}'.format)
+            # 顯示表格 (隱藏原始數值欄位，只顯示格式化後的)
             show_df = chart_df[['類別', '金額', '佔比']]
             with col_table: st.dataframe(show_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("該期間目前無支出資料。")
 
     st.divider()
     st.subheader("📄 產出財務報表")
@@ -757,6 +800,9 @@ with tab_settings:
                 iy, in_ = st.columns(2)
                 with iy:
                     if st.button("✔️ 確認匯入", key="btn_confirm_menu_imp"):
+                        # 複製大項設定
+                        settings["cat_config"][global_project] = copy.deepcopy(settings["cat_config"][source_proj])
+                        # 複製細項與地點
                         source_items = settings["items"].get(source_proj, {}); target_items = settings["items"].get(global_project, {})
                         source_locs = settings["locations"].get(source_proj, {}); target_locs = settings["locations"].get(global_project, {})
                         for cat, items in source_items.items():
@@ -916,5 +962,3 @@ with tab_settings:
                                 save_settings(settings); st.session_state[del_sub_key] = False; st.rerun()
                             if st.button("❌", key=f"no_{list_type}_{i}"): st.session_state[del_sub_key] = False; st.rerun()
         else: st.info(f"此類別目前沒有設定常用{manage_mode_display.split()[1]}。")
-
-
