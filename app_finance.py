@@ -13,7 +13,7 @@ import copy
 # --- 1. 安全匯入機制 ---
 try:
     import gspread
-    from oauth2client.service_account import ServiceAccountCredentials
+    from google.oauth2.service_account import Credentials
     HAS_GOOGLE_LIB = True
 except ImportError:
     HAS_GOOGLE_LIB = False
@@ -55,7 +55,7 @@ def check_mode():
     try:
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
         creds_dict = dict(st.secrets["gcp_service_account"])
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
         client = gspread.authorize(creds)
         client.open("FinanceData")  # 真的嘗試打開一次，確認金鑰與試算表都有效
         return "cloud", None
@@ -95,7 +95,7 @@ def get_gsheet_client():
     try:
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
         creds_dict = dict(st.secrets["gcp_service_account"])
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
         return gspread.authorize(creds)
     except Exception as e:
         # 修正：不再完全吞掉例外，記錄下來讓呼叫端可以提示使用者
@@ -330,7 +330,7 @@ def get_date_info(date_obj):
 # --- PDF 生成 (新增 prev_balance 參數以計算正確本期結餘) ---
 def generate_pdf_report(df, project_name, year, month, prev_balance=0):
     if not HAS_PDF_LIB:
-        st.error("系統缺少 'reportlab' 套件。")
+        st.error("⚠️ 系統缺少 'reportlab' 套件，無法產生 PDF。請在 requirements.txt 加入 reportlab 並重新部署 (Streamlit Cloud 需執行 Reboot)，或在本機執行 pip install reportlab。")
         return None
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=landscape(A4), rightMargin=1.5*cm, leftMargin=1.5*cm, topMargin=1.5*cm, bottomMargin=1.5*cm)
