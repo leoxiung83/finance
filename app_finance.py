@@ -40,14 +40,30 @@ FONT_FILE = 'kaiu.ttf'
 FONT_NAME = 'Kaiu'
 
 # --- 判斷執行模式 ---
+# 修正：原本只檢查 secrets 是否「存在」，不代表真的能連上雲端。
+# 這裡改成實際嘗試連線並開啟試算表一次，才判定為 cloud 模式，
+# 避免「secrets 有設定但金鑰失效/試算表不存在」時，仍誤判為 cloud
+# 導致後續寫入資料時被靜默丟棄 (見 append_record / save_dataframe 的修正)。
 def check_mode():
-    if not HAS_GOOGLE_LIB: return "local"
+    if not HAS_GOOGLE_LIB: return "local", None
     try:
-        if "gcp_service_account" in st.secrets: return "cloud"
-    except: pass
-    return "local"
+        if "gcp_service_account" not in st.secrets:
+            return "local", None
+    except Exception:
+        return "local", None
 
-MODE = check_mode()
+    try:
+        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        creds_dict = dict(st.secrets["gcp_service_account"])
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        client = gspread.authorize(creds)
+        client.open("FinanceData")  # 真的嘗試打開一次，確認金鑰與試算表都有效
+        return "cloud", None
+    except Exception as e:
+        # 記錄失敗原因，方便在側邊欄顯示，而不是完全吞掉
+        return "local", str(e)
+
+MODE, MODE_FALLBACK_REASON = check_mode()
 
 # --- 台灣例假日 ---
 HOLIDAYS = {
@@ -81,7 +97,9 @@ def get_gsheet_client():
         creds_dict = dict(st.secrets["gcp_service_account"])
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
         return gspread.authorize(creds)
-    except:
+    except Exception as e:
+        # 修正：不再完全吞掉例外，記錄下來讓呼叫端可以提示使用者
+        st.session_state["_gsheet_client_error"] = str(e)
         return None
 
 @st.cache_data(ttl=60)
@@ -106,9 +124,11 @@ def load_data():
                     df['月份'] = pd.to_datetime(df['日期']).dt.strftime("%Y-%m")
                     df['Year'] = pd.to_datetime(df['日期']).dt.year
                 return df
-        except:
-            pass 
-            
+        except Exception as e:
+            # 修正：讀取雲端資料失敗時要讓使用者知道，而不是默默切回本地資料
+            # (否則使用者可能以為自己看到的是雲端最新資料，其實是本地舊檔)
+            st.session_state["_load_data_cloud_error"] = str(e)
+
     # Local Mode
     if os.path.exists(DATA_FILE):
         try:
@@ -135,15 +155,28 @@ def save_dataframe(df):
         
         if MODE == "cloud":
             client = get_gsheet_client()
-            if client:
-                sheet = client.open("FinanceData").sheet1
-                df_save['日期'] = df_save['日期'].astype(str)
-                sheet.clear()
-                sheet.update([df_save.columns.values.tolist()] + df_save.values.tolist())
-                load_data.clear()
-                return True
+            if not client:
+                # 修正：原本這裡 client 為 None 時什麼都不做、直接結束函式，
+                # 導致呼叫端拿到 None（視同「沒存成功但也沒報錯」），資料就這樣憑空消失。
+                # 現在明確回報失敗，讓使用者知道要重新整理/檢查連線。
+                st.error("⚠️ 無法連線至雲端試算表，資料尚未儲存！請點擊「資料更新」重試，或改用本機模式暫存。")
+                return False
+            sheet = client.open("FinanceData").sheet1
+            df_save['日期'] = df_save['日期'].astype(str)
+            values = [df_save.columns.values.tolist()] + df_save.values.tolist()
+            # 修正：原本是 sheet.clear() 再 update()，中間有一段時間整張表是空的，
+            # 若此時另一位使用者或本次寫入失敗，會直接遺失全部資料。
+            # 改成先覆寫既有範圍，再把多餘的舊資料列清掉，縮短資料暴露在「空表」狀態的風險視窗。
+            old_row_count = max(sheet.row_count, len(values))
+            sheet.resize(rows=max(old_row_count, len(values)))
+            sheet.update(values)
+            if old_row_count > len(values):
+                sheet.batch_clear([f"A{len(values)+1}:Z{old_row_count}"])
+            load_data.clear()
+            return True
         else:
             df_save.to_csv(DATA_FILE, index=False, encoding='utf-8-sig')
+            load_data.clear()  # 修正：本機模式寫入後也要清快取，避免 60 秒內讀到舊資料
             return True
     except Exception as e:
         st.error(f"儲存失敗: {e}")
@@ -165,7 +198,10 @@ def load_settings():
                 ws = client.open("FinanceData").worksheet("Settings")
                 json_str = ws.acell('A1').value
                 if json_str: settings = json.loads(json_str)
-        except: pass
+            else:
+                st.warning("⚠️ 無法連線雲端設定，暫時使用預設設定值。")
+        except Exception as e:
+            st.warning(f"⚠️ 讀取雲端設定失敗，暫時使用預設設定值：{e}")
     else:
         if os.path.exists(SETTINGS_FILE):
             with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
@@ -198,32 +234,48 @@ def load_settings():
     return settings
 
 def save_settings(data):
+    # 修正：原本沒有回傳值，呼叫端無法得知設定是否真的存檔成功，
+    # 雲端連線失敗時使用者會以為設定已更新，實際上完全沒儲存。
     if MODE == "cloud":
         try:
             client = get_gsheet_client()
-            if client:
-                ws = client.open("FinanceData").worksheet("Settings")
-                ws.update('A1', [[json.dumps(data, ensure_ascii=False)]])
-        except: pass
+            if not client:
+                st.error("⚠️ 無法連線至雲端，設定尚未儲存！")
+                return False
+            ws = client.open("FinanceData").worksheet("Settings")
+            ws.update('A1', [[json.dumps(data, ensure_ascii=False)]])
+            return True
+        except Exception as e:
+            st.error(f"⚠️ 雲端設定儲存失敗：{e}")
+            return False
     else:
-        with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=4)
+        try:
+            with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=4)
+            return True
+        except Exception as e:
+            st.error(f"⚠️ 設定儲存失敗：{e}")
+            return False
 
 def append_record(record_dict):
     if MODE == "cloud":
         try:
             client = get_gsheet_client()
-            if client:
-                sheet = client.open("FinanceData").sheet1
-                row = [
-                    str(record_dict['日期']), record_dict['專案'], record_dict['類別'], record_dict['項目內容'],
-                    record_dict['單位'], record_dict['數量'], record_dict['單價'], record_dict['總價'],
-                    record_dict['購買地點'], record_dict['經手人'], record_dict['憑證類型'],
-                    str(record_dict['發票號碼']), record_dict['備註']
-                ]
-                sheet.append_row(row)
-                load_data.clear() 
-                return True
+            if not client:
+                # 修正：原本 client 為 None 時，函式沒有 return，
+                # 會隱性回傳 None，這筆紀錄就直接遺失且沒有任何錯誤提示。
+                st.error("⚠️ 無法連線至雲端試算表，這筆紀錄尚未儲存，請重新嘗試！")
+                return False
+            sheet = client.open("FinanceData").sheet1
+            row = [
+                str(record_dict['日期']), record_dict['專案'], record_dict['類別'], record_dict['項目內容'],
+                record_dict['單位'], record_dict['數量'], record_dict['單價'], record_dict['總價'],
+                record_dict['購買地點'], record_dict['經手人'], record_dict['憑證類型'],
+                str(record_dict['發票號碼']), record_dict['備註']
+            ]
+            sheet.append_row(row)
+            load_data.clear() 
+            return True
         except Exception as e:
             st.error(f"雲端寫入錯誤: {e}")
             return False
@@ -419,7 +471,11 @@ with st.sidebar:
         elif "gcp_service_account" not in st.secrets:
             st.caption("⚠️ 單機模式 (未偵測到金鑰)")
         else:
-            st.caption("💻 單機模式 (連線失敗)")
+            st.caption("💻 單機模式 (雲端連線失敗)")
+            # 修正：顯示實際失敗原因，方便排查金鑰過期/試算表名稱不符等問題
+            if MODE_FALLBACK_REASON:
+                with st.expander("查看失敗原因", expanded=False):
+                    st.code(MODE_FALLBACK_REASON)
     else:
         st.caption("✅ 雲端連線正常")
         
@@ -521,7 +577,13 @@ with tab_data:
         with c_filter3: search_kw = st.text_input("🔍 搜尋關鍵字", placeholder="輸入項目、備註或發票號碼...")
         view_df = year_df.copy()
         if sel_month != "整年": view_df = view_df[view_df['月份'] == sel_month]
-        if search_kw: view_df = view_df[view_df['項目內容'].str.contains(search_kw, case=False) | view_df['備註'].str.contains(search_kw, case=False) | view_df['發票號碼'].str.contains(search_kw, case=False)]
+        if search_kw:
+            # 修正：原本用 str.contains 沒有 regex=False，若搜尋字含有 ( ) . + * 等正則特殊字元會報錯或誤判
+            view_df = view_df[
+                view_df['項目內容'].str.contains(search_kw, case=False, regex=False, na=False) |
+                view_df['備註'].str.contains(search_kw, case=False, regex=False, na=False) |
+                view_df['發票號碼'].str.contains(search_kw, case=False, regex=False, na=False)
+            ]
         
         st.divider()
         if view_df.empty: st.warning("查無符合條件的資料")
@@ -890,22 +952,36 @@ with tab_settings:
     with st.expander("2. 記錄項目管理 (修改標題/新增/刪除)", expanded=False):
         st.info("此處修改會影響所有專案的選單顯示。")
         for idx, cat in enumerate(current_cat_config):
+            # 修正：原本用清單索引 idx 當 session_state key，
+            # 新增/刪除項目導致順序變動時，確認框可能會「跳」到別的項目上。
+            # 改用分類本身的 key（在同一專案內不會重複）當識別碼，較穩定。
+            cat_uid = cat["key"]
             c_label, c_input, c_btn, c_del = st.columns([2, 3, 1, 1])
             with c_label: st.text(f"原標題: {cat['display']}")
-            with c_input: new_display = st.text_input(f"新名稱 {idx}", value=cat["display"], label_visibility="collapsed", key=f"cat_ren_{idx}")
+            with c_input: new_display = st.text_input(f"新名稱 {idx}", value=cat["display"], label_visibility="collapsed", key=f"cat_ren_{cat_uid}")
             with c_btn:
                 if new_display != cat["display"]:
-                    if st.button("更新", key=f"btn_upd_cat_{idx}"):
+                    if st.button("更新", key=f"btn_upd_cat_{cat_uid}"):
                         current_cat_config[idx]["display"] = new_display; save_settings(settings); st.success("標題已更新"); time.sleep(0.5); st.rerun()
             with c_del:
-                del_cat_key = f"del_cat_{idx}_confirm"
+                del_cat_key = f"del_cat_{cat_uid}_confirm"
                 if del_cat_key not in st.session_state: st.session_state[del_cat_key] = False
                 if not st.session_state[del_cat_key]:
-                    if st.button("刪除", key=f"btn_del_cat_{idx}"): st.session_state[del_cat_key] = True; st.rerun()
+                    if st.button("刪除", key=f"btn_del_cat_{cat_uid}"): st.session_state[del_cat_key] = True; st.rerun()
                 else:
-                    if st.button("✔️", key=f"yes_cat_{idx}"):
-                        current_cat_config.pop(idx); save_settings(settings); st.session_state[del_cat_key] = False; st.rerun()
-                    if st.button("❌", key=f"no_cat_{idx}"): st.session_state[del_cat_key] = False; st.rerun()
+                    # 修正：刪除分類前檢查該分類在「目前專案」是否仍有歷史紀錄。
+                    # 原本刪除後，這些紀錄不會被清除，只是從所有畫面消失變成孤兒資料，
+                    # 使用者會誤以為資料不見了。這裡改成先擋下來，請使用者自行處理。
+                    has_records = (not df.empty) and (
+                        (df['專案'] == global_project) & (df['類別'] == cat['key'])
+                    ).any()
+                    if has_records:
+                        st.error(f"⚠️ 無法刪除：「{cat['display']}」在本專案仍有歷史紀錄，請先在「明細管理」刪除或搬移相關紀錄。")
+                        if st.button("取消", key=f"no_cat_{cat_uid}"): st.session_state[del_cat_key] = False; st.rerun()
+                    else:
+                        if st.button("✔️", key=f"yes_cat_{cat_uid}"):
+                            current_cat_config.pop(idx); save_settings(settings); st.session_state[del_cat_key] = False; st.rerun()
+                        if st.button("❌", key=f"no_cat_{cat_uid}"): st.session_state[del_cat_key] = False; st.rerun()
     with st.expander("3. 細項選單管理 (修改標題/新增/刪除)", expanded=True):
         target_cat = st.selectbox("選擇要管理的大項", [c["display"] for c in current_cat_config])
         cat_key = next(c["key"] for c in current_cat_config if c["display"] == target_cat)
