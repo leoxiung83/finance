@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import os
 import json
+import time
 import altair as alt
 import streamlit.components.v1 as components
 from datetime import datetime
@@ -503,6 +504,7 @@ with tab_entry:
                         with st.spinner("正在儲存..."):
                             if append_record(record):
                                 st.toast(f"✅ {conf['display']} 儲存成功！")
+                                time.sleep(0.5)
 
 # --- Tab 2: 明細管理 (修正：使用 st.form 包裹 st.data_editor 防止勾選時自動重整) ---
 with tab_data:
@@ -570,7 +572,7 @@ with tab_data:
                                 if sel_month != "整年": mask = mask & (current_full_df['月份'] == sel_month)
                                 df_kept = current_full_df[~mask]
                                 df_add = final_df.drop(columns=['刪除', '星期/節日'], errors='ignore')
-                                if save_dataframe(pd.concat([df_kept, df_add], ignore_index=True)): st.success("更新成功！"); st.rerun()
+                                if save_dataframe(pd.concat([df_kept, df_add], ignore_index=True)): st.success("更新成功！"); time.sleep(1); st.rerun()
 
                     # --- 刪除按鈕邏輯 (檢查勾選並設定 Session State) ---
                     if submit_delete:
@@ -772,7 +774,7 @@ with tab_settings:
                         settings["locations"][new_proj] = {c["key"]: [] for c in settings["cat_config"]}
                         # 複製預設設定給新專案
                         settings["cat_config"][new_proj] = copy.deepcopy(DEFAULT_CAT_CONFIG)
-                        save_settings(settings); st.success(f"已新增專案：{new_proj}"); st.rerun()
+                        save_settings(settings); st.success(f"已新增專案：{new_proj}"); time.sleep(1); st.rerun()
             st.divider()
             with st.form(key="form_ren_project"): # FORM
                 rename_proj = st.text_input("修改目前專案名稱", value=global_project)
@@ -787,7 +789,7 @@ with tab_settings:
                             settings["item_details"][rename_proj] = settings["item_details"].pop(global_project)
                         save_settings(settings)
                         if not df.empty: df.loc[df['專案'] == global_project, '專案'] = rename_proj; save_dataframe(df)
-                        st.success(f"專案已改名為：{rename_proj}"); st.rerun()
+                        st.success(f"專案已改名為：{rename_proj}"); time.sleep(1); st.rerun()
         with c2:
             st.subheader("匯入與刪除")
             other_projects = [p for p in settings["projects"] if p != global_project]
@@ -811,7 +813,7 @@ with tab_settings:
                                 if cat not in target_locs: target_locs[cat] = []
                                 for loc in locs:
                                     if loc not in target_locs[cat]: target_locs[cat].append(loc)
-                            save_settings(settings); st.success("匯入完成！"); st.session_state.import_confirm = False; st.rerun()
+                            save_settings(settings); st.success("匯入完成！"); st.session_state.import_confirm = False; time.sleep(1); st.rerun()
                     with in_:
                         if st.button("❌ 取消匯入"): st.session_state.import_confirm = False; st.rerun()
             st.divider(); st.info(f"正在管理專案：{global_project}")
@@ -832,7 +834,7 @@ with tab_settings:
                         if global_project in settings.get("item_details", {}): del settings["item_details"][global_project]
                         save_settings(settings)
                         if not df.empty: df = df[df['專案'] != global_project]; save_dataframe(df)
-                        st.session_state.del_proj_confirm = False; st.success("專案已刪除"); st.rerun()
+                        st.session_state.del_proj_confirm = False; st.success("專案已刪除"); time.sleep(1); st.rerun()
                 with col_n:
                     if st.button("❌ 否，取消"): st.session_state.del_proj_confirm = False; st.rerun()
     st.divider(); st.markdown("### 二、大項管理")
@@ -862,7 +864,7 @@ with tab_settings:
                             if cat not in target_locs: target_locs[cat] = []
                             for loc in locs:
                                 if loc not in target_locs[cat]: target_locs[cat].append(loc)
-                        save_settings(settings); st.success("選單匯入成功！"); st.session_state.menu_import_confirm = False; st.rerun()
+                        save_settings(settings); st.success("選單匯入成功！"); st.session_state.menu_import_confirm = False; time.sleep(1); st.rerun()
                 with in_:
                     if st.button("❌ 取消", key="btn_cancel_menu_imp"): st.session_state.menu_import_confirm = False; st.rerun()
         else: st.warning("目前只有一個專案，無法執行匯入。")
@@ -884,7 +886,7 @@ with tab_settings:
                             for proj in settings["items"]:
                                 if new_key not in settings["items"][proj]: settings["items"][proj][new_key] = []
                                 if new_key not in settings["locations"][proj]: settings["locations"][proj][new_key] = []
-                            save_settings(settings); st.success("已新增"); st.rerun()
+                            save_settings(settings); st.success("已新增"); time.sleep(0.5); st.rerun()
     with st.expander("2. 記錄項目管理 (修改標題/新增/刪除)", expanded=False):
         st.info("此處修改會影響所有專案的選單顯示。")
         for idx, cat in enumerate(current_cat_config):
@@ -894,7 +896,7 @@ with tab_settings:
             with c_btn:
                 if new_display != cat["display"]:
                     if st.button("更新", key=f"btn_upd_cat_{idx}"):
-                        current_cat_config[idx]["display"] = new_display; save_settings(settings); st.success("標題已更新"); st.rerun()
+                        current_cat_config[idx]["display"] = new_display; save_settings(settings); st.success("標題已更新"); time.sleep(0.5); st.rerun()
             with c_del:
                 del_cat_key = f"del_cat_{idx}_confirm"
                 if del_cat_key not in st.session_state: st.session_state[del_cat_key] = False
@@ -971,7 +973,7 @@ with tab_settings:
                                     del settings["item_details"][global_project][it]
                             # 2. Update Details
                             settings["item_details"][global_project][rn] = {"price": rp, "unit": ru}
-                            save_settings(settings); st.toast("已更新"); st.rerun()
+                            save_settings(settings); st.toast("已更新"); time.sleep(0.5); st.rerun()
                     with ic5:
                         del_sub_key = f"del_item_confirm_{i}_{list_type}"
                         if del_sub_key not in st.session_state: st.session_state[del_sub_key] = False
@@ -998,7 +1000,7 @@ with tab_settings:
                                 if not df.empty:
                                     mask = (df['專案'] == global_project) & (df['類別'] == cat_key) & (df['購買地點'] == item)
                                     df.loc[mask, '購買地點'] = ren_item; save_dataframe(df)
-                                save_settings(settings); st.toast("名稱已更新"); st.rerun()
+                                save_settings(settings); st.toast("名稱已更新"); time.sleep(0.5); st.rerun()
                         else: st.button("💾", key=f"save_{list_type}_{i}", disabled=True)
                     with ic4:
                         del_sub_key = f"del_{list_type}_{i}_confirm"
