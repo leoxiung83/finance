@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import os
 import json
+import time
 import altair as alt
 import streamlit.components.v1 as components
 from datetime import datetime
@@ -83,40 +84,15 @@ def get_gsheet_client():
     except:
         return None
 
-@st.cache_resource
-def get_finance_sheet():
-    """取得 FinanceData 工作表並快取，避免每次操作都重新 open spreadsheet。"""
-    if MODE != "cloud":
-        return None
-    try:
-        client = get_gsheet_client()
-        if client:
-            return client.open("FinanceData").sheet1
-    except Exception:
-        return None
-    return None
-
-@st.cache_resource
-def get_settings_sheet():
-    """取得 Settings 工作表並快取。"""
-    if MODE != "cloud":
-        return None
-    try:
-        client = get_gsheet_client()
-        if client:
-            return client.open("FinanceData").worksheet("Settings")
-    except Exception:
-        return None
-    return None
-
 @st.cache_data(ttl=60)
 def load_data():
     cols = ['日期', '專案', '類別', '項目內容', '單位', '數量', '單價', '總價', '購買地點', '經手人', '憑證類型', '發票號碼', '備註', '月份', 'Year']
     
     if MODE == "cloud":
         try:
-            sheet = get_finance_sheet()
-            if sheet:
+            client = get_gsheet_client()
+            if client:
+                sheet = client.open("FinanceData").sheet1
                 data = sheet.get_all_records()
                 df = pd.DataFrame(data) if data else pd.DataFrame(columns=cols)
                 for c in cols:
@@ -158,8 +134,9 @@ def save_dataframe(df):
         df_save = df.drop(columns=[c for c in cols_to_drop if c in df.columns])
         
         if MODE == "cloud":
-            sheet = get_finance_sheet()
-            if sheet:
+            client = get_gsheet_client()
+            if client:
+                sheet = client.open("FinanceData").sheet1
                 df_save['日期'] = df_save['日期'].astype(str)
                 sheet.clear()
                 sheet.update([df_save.columns.values.tolist()] + df_save.values.tolist())
@@ -167,13 +144,11 @@ def save_dataframe(df):
                 return True
         else:
             df_save.to_csv(DATA_FILE, index=False, encoding='utf-8-sig')
-            load_data.clear()
             return True
     except Exception as e:
         st.error(f"儲存失敗: {e}")
         return False
 
-@st.cache_data(ttl=60)
 def load_settings():
     default = {
         "projects": ["預設專案"],
@@ -185,8 +160,9 @@ def load_settings():
     settings = default
     if MODE == "cloud":
         try:
-            ws = get_settings_sheet()
-            if ws:
+            client = get_gsheet_client()
+            if client:
+                ws = client.open("FinanceData").worksheet("Settings")
                 json_str = ws.acell('A1').value
                 if json_str: settings = json.loads(json_str)
         except: pass
@@ -222,28 +198,23 @@ def load_settings():
     return settings
 
 def save_settings(data):
-    """儲存設定並立即清除快取，避免畫面仍顯示舊設定。"""
-    try:
-        if MODE == "cloud":
-            ws = get_settings_sheet()
-            if not ws:
-                st.error("無法取得雲端 Settings 工作表。")
-                return False
-            ws.update('A1', [[json.dumps(data, ensure_ascii=False)]])
-        else:
-            with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=4)
-        load_settings.clear()
-        return True
-    except Exception as e:
-        st.error(f"設定儲存失敗: {e}")
-        return False
+    if MODE == "cloud":
+        try:
+            client = get_gsheet_client()
+            if client:
+                ws = client.open("FinanceData").worksheet("Settings")
+                ws.update('A1', [[json.dumps(data, ensure_ascii=False)]])
+        except: pass
+    else:
+        with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
 
 def append_record(record_dict):
     if MODE == "cloud":
         try:
-            sheet = get_finance_sheet()
-            if sheet:
+            client = get_gsheet_client()
+            if client:
+                sheet = client.open("FinanceData").sheet1
                 row = [
                     str(record_dict['日期']), record_dict['專案'], record_dict['類別'], record_dict['項目內容'],
                     record_dict['單位'], record_dict['數量'], record_dict['單價'], record_dict['總價'],
@@ -533,6 +504,7 @@ with tab_entry:
                         with st.spinner("正在儲存..."):
                             if append_record(record):
                                 st.toast(f"✅ {conf['display']} 儲存成功！")
+                                time.sleep(0.5)
 
 # --- Tab 2: 明細管理 (修正：使用 st.form 包裹 st.data_editor 防止勾選時自動重整) ---
 with tab_data:
@@ -600,7 +572,7 @@ with tab_data:
                                 if sel_month != "整年": mask = mask & (current_full_df['月份'] == sel_month)
                                 df_kept = current_full_df[~mask]
                                 df_add = final_df.drop(columns=['刪除', '星期/節日'], errors='ignore')
-                                if save_dataframe(pd.concat([df_kept, df_add], ignore_index=True)): st.success("更新成功！"); st.rerun()
+                                if save_dataframe(pd.concat([df_kept, df_add], ignore_index=True)): st.success("更新成功！"); time.sleep(1); st.rerun()
 
                     # --- 刪除按鈕邏輯 (檢查勾選並設定 Session State) ---
                     if submit_delete:
@@ -637,7 +609,8 @@ with tab_data:
                                         st.success("已刪除"); 
                                         # 清除狀態
                                         st.session_state[f"confirm_del_{conf['key']}"] = False
-                                        del st.session_state[f"pending_del_df_{conf['key']}"]; st.rerun()
+                                        del st.session_state[f"pending_del_df_{conf['key']}"]
+                                        time.sleep(1); st.rerun()
                                         
                         if col_no.button("❌ 否，取消", key=f"no_{conf['key']}"):
                             st.session_state[f"confirm_del_{conf['key']}"] = False
@@ -783,7 +756,8 @@ with tab_settings:
                         with zipfile.ZipFile(uploaded_file, 'r') as z:
                             if 'finance_data.csv' in z.namelist(): save_dataframe(pd.read_csv(z.open('finance_data.csv')))
                             if 'finance_settings.json' in z.namelist(): save_settings(json.load(z.open('finance_settings.json')))
-                        st.success("ZIP 還原成功！"); st.rerun()
+                        st.success("ZIP 還原成功！")
+                    time.sleep(1); st.rerun()
                 except Exception as e: st.error(f"還原失敗: {e}")
 
     with st.expander("2. 專案管理 (新增/匯入/改名/刪除)", expanded=True):
@@ -800,7 +774,7 @@ with tab_settings:
                         settings["locations"][new_proj] = {c["key"]: [] for c in settings["cat_config"]}
                         # 複製預設設定給新專案
                         settings["cat_config"][new_proj] = copy.deepcopy(DEFAULT_CAT_CONFIG)
-                        save_settings(settings); st.success(f"已新增專案：{new_proj}"); st.rerun()
+                        save_settings(settings); st.success(f"已新增專案：{new_proj}"); time.sleep(1); st.rerun()
             st.divider()
             with st.form(key="form_ren_project"): # FORM
                 rename_proj = st.text_input("修改目前專案名稱", value=global_project)
@@ -815,7 +789,7 @@ with tab_settings:
                             settings["item_details"][rename_proj] = settings["item_details"].pop(global_project)
                         save_settings(settings)
                         if not df.empty: df.loc[df['專案'] == global_project, '專案'] = rename_proj; save_dataframe(df)
-                        st.success(f"專案已改名為：{rename_proj}"); st.rerun()
+                        st.success(f"專案已改名為：{rename_proj}"); time.sleep(1); st.rerun()
         with c2:
             st.subheader("匯入與刪除")
             other_projects = [p for p in settings["projects"] if p != global_project]
@@ -839,7 +813,7 @@ with tab_settings:
                                 if cat not in target_locs: target_locs[cat] = []
                                 for loc in locs:
                                     if loc not in target_locs[cat]: target_locs[cat].append(loc)
-                            save_settings(settings); st.success("匯入完成！"); st.session_state.import_confirm = False; st.rerun()
+                            save_settings(settings); st.success("匯入完成！"); st.session_state.import_confirm = False; time.sleep(1); st.rerun()
                     with in_:
                         if st.button("❌ 取消匯入"): st.session_state.import_confirm = False; st.rerun()
             st.divider(); st.info(f"正在管理專案：{global_project}")
@@ -860,7 +834,7 @@ with tab_settings:
                         if global_project in settings.get("item_details", {}): del settings["item_details"][global_project]
                         save_settings(settings)
                         if not df.empty: df = df[df['專案'] != global_project]; save_dataframe(df)
-                        st.session_state.del_proj_confirm = False; st.success("專案已刪除"); st.rerun()
+                        st.session_state.del_proj_confirm = False; st.success("專案已刪除"); time.sleep(1); st.rerun()
                 with col_n:
                     if st.button("❌ 否，取消"): st.session_state.del_proj_confirm = False; st.rerun()
     st.divider(); st.markdown("### 二、大項管理")
@@ -890,7 +864,7 @@ with tab_settings:
                             if cat not in target_locs: target_locs[cat] = []
                             for loc in locs:
                                 if loc not in target_locs[cat]: target_locs[cat].append(loc)
-                        save_settings(settings); st.success("選單匯入成功！"); st.session_state.menu_import_confirm = False; st.rerun()
+                        save_settings(settings); st.success("選單匯入成功！"); st.session_state.menu_import_confirm = False; time.sleep(1); st.rerun()
                 with in_:
                     if st.button("❌ 取消", key="btn_cancel_menu_imp"): st.session_state.menu_import_confirm = False; st.rerun()
         else: st.warning("目前只有一個專案，無法執行匯入。")
@@ -912,7 +886,7 @@ with tab_settings:
                             for proj in settings["items"]:
                                 if new_key not in settings["items"][proj]: settings["items"][proj][new_key] = []
                                 if new_key not in settings["locations"][proj]: settings["locations"][proj][new_key] = []
-                            save_settings(settings); st.success("已新增"); st.rerun()
+                            save_settings(settings); st.success("已新增"); time.sleep(0.5); st.rerun()
     with st.expander("2. 記錄項目管理 (修改標題/新增/刪除)", expanded=False):
         st.info("此處修改會影響所有專案的選單顯示。")
         for idx, cat in enumerate(current_cat_config):
@@ -922,7 +896,7 @@ with tab_settings:
             with c_btn:
                 if new_display != cat["display"]:
                     if st.button("更新", key=f"btn_upd_cat_{idx}"):
-                        current_cat_config[idx]["display"] = new_display; save_settings(settings); st.success("標題已更新"); st.rerun()
+                        current_cat_config[idx]["display"] = new_display; save_settings(settings); st.success("標題已更新"); time.sleep(0.5); st.rerun()
             with c_del:
                 del_cat_key = f"del_cat_{idx}_confirm"
                 if del_cat_key not in st.session_state: st.session_state[del_cat_key] = False
@@ -999,7 +973,7 @@ with tab_settings:
                                     del settings["item_details"][global_project][it]
                             # 2. Update Details
                             settings["item_details"][global_project][rn] = {"price": rp, "unit": ru}
-                            save_settings(settings); st.toast("已更新"); st.rerun()
+                            save_settings(settings); st.toast("已更新"); time.sleep(0.5); st.rerun()
                     with ic5:
                         del_sub_key = f"del_item_confirm_{i}_{list_type}"
                         if del_sub_key not in st.session_state: st.session_state[del_sub_key] = False
@@ -1026,7 +1000,7 @@ with tab_settings:
                                 if not df.empty:
                                     mask = (df['專案'] == global_project) & (df['類別'] == cat_key) & (df['購買地點'] == item)
                                     df.loc[mask, '購買地點'] = ren_item; save_dataframe(df)
-                                save_settings(settings); st.toast("名稱已更新"); st.rerun()
+                                save_settings(settings); st.toast("名稱已更新"); time.sleep(0.5); st.rerun()
                         else: st.button("💾", key=f"save_{list_type}_{i}", disabled=True)
                     with ic4:
                         del_sub_key = f"del_{list_type}_{i}_confirm"
